@@ -1,0 +1,2 @@
+[console_scripts]
+zapret-hub = zapret_hub.main:main
