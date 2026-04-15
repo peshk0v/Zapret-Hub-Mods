@@ -3,9 +3,11 @@
 import ctypes
 import sys
 import threading
+import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 
+from zapret_hub import __version__
 from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QCloseEvent, QIcon, QMouseEvent, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
@@ -65,6 +67,8 @@ class _UiSignals(QObject):
     component_action_done = Signal(str)
     general_test_progress = Signal(int, int, str)
     general_test_done = Signal(object)
+    update_check_done = Signal(object, bool)
+    update_prepare_done = Signal(object)
 
 
 class SidebarPanel(QFrame):
@@ -246,9 +250,14 @@ class SettingsDialog(AppDialog):
         layout.addLayout(form)
 
         credits = QLabel(
-            "Credits: original zapret bundle and tg-ws-proxy by Flowseal.\n"
-            "Original zapret ecosystem by bol-van.\n"
-            "This app is a separate management UI."
+            self._t(
+                "Credits: original zapret bundle and tg-ws-proxy by Flowseal.\n"
+                "Original zapret ecosystem by bol-van.\n"
+                f"This app is a separate management UI.\nVersion: {__version__}",
+                "Credits: original zapret bundle and tg-ws-proxy by Flowseal.\n"
+                "Original zapret ecosystem by bol-van.\n"
+                f"This app is a separate management UI.\nVersion: {__version__}",
+            )
         )
         credits.setProperty("class", "muted")
         layout.addWidget(credits)
@@ -305,9 +314,11 @@ class SettingsDialog(AppDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, context: ApplicationContext) -> None:
+    def __init__(self, context: ApplicationContext, launch_hidden: bool = False) -> None:
         super().__init__()
         self.context = context
+        self._launch_hidden = launch_hidden
+        self._skip_next_show_focus = launch_hidden
         self._drag_pos: QPoint | None = None
         self._tray_notifications_shown = False
         self._force_exit = False
@@ -329,6 +340,8 @@ class MainWindow(QMainWindow):
         self._ui_signals.component_action_done.connect(self._on_component_action_done)
         self._ui_signals.general_test_progress.connect(self._on_general_test_progress)
         self._ui_signals.general_test_done.connect(self._on_general_test_done)
+        self._ui_signals.update_check_done.connect(self._on_update_check_done)
+        self._ui_signals.update_prepare_done.connect(self._on_update_prepare_done)
         self._updating_general_combo = False
         self._pending_info_message: tuple[str, str] | None = None
         self._components_cards_root: QWidget | None = None
@@ -358,6 +371,9 @@ class MainWindow(QMainWindow):
         self._logs_refresh_btn: QPushButton | None = None
         self._tray_show_action: QAction | None = None
         self._tray_quit_action: QAction | None = None
+        self._update_check_in_progress = False
+        self._update_prepare_dialog: AppDialog | None = None
+        self._last_prompted_update_version = ""
 
         self._icons_dir = self.context.paths.ui_assets_dir / "icons"
         self._nav_items = [
@@ -380,8 +396,10 @@ class MainWindow(QMainWindow):
         self._setup_tray()
         self._apply_theme()
         self.refresh_all()
-        QTimer.singleShot(800, self._maybe_run_first_general_autotest)
-        QTimer.singleShot(0, lambda: _bring_widget_to_front(self))
+        if not self._launch_hidden:
+            QTimer.singleShot(800, self._maybe_run_first_general_autotest)
+            QTimer.singleShot(1400, self._check_updates_on_start)
+            QTimer.singleShot(0, lambda: _bring_widget_to_front(self))
 
     def _t(self, ru: str, en: str) -> str:
         return ru if self.context.settings.get().language == "ru" else en
@@ -393,6 +411,9 @@ class MainWindow(QMainWindow):
     def showEvent(self, event: QEvent) -> None:
         super().showEvent(event)
         _disable_native_window_rounding(self)
+        if self._skip_next_show_focus:
+            self._skip_next_show_focus = False
+            return
         QTimer.singleShot(0, lambda: _bring_widget_to_front(self))
 
     def _build_ui(self) -> None:
@@ -880,9 +901,13 @@ class MainWindow(QMainWindow):
             self._force_exit = True
         self._shutdown_runtime()
         event.accept()
+        app = QCoreApplication.instance()
+        if app is not None:
+            QTimer.singleShot(0, app.quit)
         super().closeEvent(event)
 
     def _restore_from_tray(self) -> None:
+        self.refresh_all()
         self.showNormal()
         _bring_widget_to_front(self)
 
@@ -1157,20 +1182,21 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _toggle_master_runtime_worker(self) -> None:
-        states = {s.component_id: s for s in self.context.processes.list_states()}
-        active_ids = self._master_active_components()
-        if not active_ids:
+        try:
+            states = {s.component_id: s for s in self.context.processes.list_states()}
+            active_ids = self._master_active_components()
+            if not active_ids:
+                return
+            running_ids = {cid for cid in active_ids if states.get(cid) and states[cid].status == "running"}
+            if running_ids == set(active_ids):
+                for cid in active_ids:
+                    self.context.processes.stop_component(cid)
+            else:
+                for cid in active_ids:
+                    if cid not in running_ids:
+                        self.context.processes.start_component(cid)
+        finally:
             self._ui_signals.toggle_done.emit()
-            return
-        running_ids = {cid for cid in active_ids if states.get(cid) and states[cid].status == "running"}
-        if running_ids == set(active_ids):
-            for cid in active_ids:
-                self.context.processes.stop_component(cid)
-        else:
-            for cid in active_ids:
-                if cid not in running_ids:
-                    self.context.processes.start_component(cid)
-        self._ui_signals.toggle_done.emit()
 
     def _on_master_toggle_finished(self) -> None:
         self._loading_timer.stop()
@@ -1366,9 +1392,147 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def _check_updates_popup(self) -> None:
-        items = self.context.updates.check_updates()
-        text = "\n".join(f"{item.target}: {item.status} ({item.current_version})" for item in items)
-        self._show_info(self._t("Обновления", "Updates"), text or self._t("Нет данных об обновлениях.", "No update data."))
+        self._start_update_check(manual=True)
+
+    def _check_updates_on_start(self) -> None:
+        if self._launch_hidden:
+            return
+        if not self.context.settings.get().check_updates_on_start:
+            return
+        self._start_update_check(manual=False)
+
+    def _start_update_check(self, manual: bool) -> None:
+        if self._update_check_in_progress:
+            return
+        self._update_check_in_progress = True
+        thread = threading.Thread(target=self._run_update_check_worker, args=(manual,), daemon=True)
+        thread.start()
+
+    def _run_update_check_worker(self, manual: bool) -> None:
+        release = self.context.updates.fetch_latest_application_release()
+        self._ui_signals.update_check_done.emit(release, manual)
+
+    def _on_update_check_done(self, release: object, manual: bool) -> None:
+        self._update_check_in_progress = False
+        if not isinstance(release, dict):
+            if manual:
+                self._show_error(self._t("Обновления", "Updates"), self._t("Не удалось проверить обновления.", "Failed to check for updates."))
+            return
+
+        status = str(release.get("status", "error"))
+        latest_version = str(release.get("latest_version", ""))
+        if status == "available":
+            if manual or self._last_prompted_update_version != latest_version:
+                self._last_prompted_update_version = latest_version
+                self._show_update_prompt(release)
+            return
+        if manual:
+            if status == "up-to-date":
+                self._show_info(
+                    self._t("Обновления", "Updates"),
+                    self._t(
+                        f"У вас уже установлена последняя версия: {release.get('current_version', '')}.",
+                        f"You already have the latest version: {release.get('current_version', '')}.",
+                    ),
+                )
+            else:
+                self._show_error(
+                    self._t("Обновления", "Updates"),
+                    str(release.get("error", self._t("Не удалось проверить обновления.", "Failed to check for updates."))),
+                )
+
+    def _show_update_prompt(self, release: dict[str, str]) -> None:
+        dialog = AppDialog(self, self.context, self._t("Доступно обновление", "Update available"))
+        message = QLabel(
+            self._t(
+                f"Вышла новая версия Zapret Hub.\n\nТекущая версия: {release.get('current_version', '')}\nНовая версия: {release.get('latest_version', '')}",
+                f"A new Zapret Hub version is available.\n\nCurrent version: {release.get('current_version', '')}\nNew version: {release.get('latest_version', '')}",
+            )
+        )
+        message.setWordWrap(True)
+        dialog.body_layout.addWidget(message)
+
+        body = str(release.get("body", "")).strip()
+        if body:
+            notes = QLabel(body[:800])
+            notes.setWordWrap(True)
+            notes.setProperty("class", "muted")
+            dialog.body_layout.addWidget(notes)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        close_btn = QPushButton(self._t("Закрыть", "Close"))
+        link_btn = QPushButton(self._t("Открыть ссылку", "Open link"))
+        update_btn = QPushButton(self._t("Обновить сейчас", "Update now"))
+        update_btn.setProperty("class", "primary")
+        close_btn.clicked.connect(dialog.reject)
+        link_btn.clicked.connect(lambda: self._open_update_link(str(release.get("html_url", ""))))
+        update_btn.clicked.connect(lambda: self._start_update_apply(dialog, release))
+        row.addWidget(close_btn)
+        row.addWidget(link_btn)
+        row.addWidget(update_btn)
+        dialog.body_layout.addLayout(row)
+        dialog.prepare_and_center()
+        dialog.exec()
+
+    def _open_update_link(self, url: str) -> None:
+        if not url:
+            return
+        try:
+            if sys.platform.startswith("win"):
+                import os
+
+                os.startfile(url)  # type: ignore[attr-defined]
+            else:
+                webbrowser.open(url)
+        except Exception:
+            webbrowser.open(url)
+
+    def _start_update_apply(self, parent_dialog: AppDialog, release: dict[str, str]) -> None:
+        parent_dialog.accept()
+        if self._update_prepare_dialog is not None:
+            return
+        dialog = AppDialog(self, self.context, self._t("Подготовка обновления", "Preparing update"))
+        label = QLabel(self._t("Скачиваем и подготавливаем новую версию. Приложение перезапустится автоматически.", "Downloading and preparing the new version. The app will restart automatically."))
+        label.setWordWrap(True)
+        dialog.body_layout.addWidget(label)
+        bar = QProgressBar()
+        bar.setRange(0, 0)
+        dialog.body_layout.addWidget(bar)
+        dialog.prepare_and_center()
+        dialog.show()
+        self._update_prepare_dialog = dialog
+        thread = threading.Thread(target=self._run_update_prepare_worker, args=(release,), daemon=True)
+        thread.start()
+
+    def _run_update_prepare_worker(self, release: dict[str, str]) -> None:
+        try:
+            prepared = self.context.updates.prepare_update(release)
+            self._ui_signals.update_prepare_done.emit({"ok": True, "prepared": prepared})
+        except Exception as error:
+            self._ui_signals.update_prepare_done.emit({"ok": False, "error": str(error)})
+
+    def _on_update_prepare_done(self, payload: object) -> None:
+        if self._update_prepare_dialog is not None:
+            self._update_prepare_dialog.accept()
+            self._update_prepare_dialog = None
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            self._show_error(
+                self._t("Обновления", "Updates"),
+                str((payload or {}).get("error", self._t("Не удалось подготовить обновление.", "Failed to prepare the update."))) if isinstance(payload, dict) else self._t("Не удалось подготовить обновление.", "Failed to prepare the update."),
+            )
+            return
+        prepared = payload.get("prepared")
+        if not isinstance(prepared, dict):
+            self._show_error(self._t("Обновления", "Updates"), self._t("Некорректный пакет обновления.", "Invalid update package."))
+            return
+        try:
+            self.context.updates.launch_update(prepared)
+        except Exception as error:
+            self._show_error(self._t("Обновления", "Updates"), str(error))
+            return
+        self._force_exit = True
+        self.close()
 
     def _run_diagnostics_popup(self) -> None:
         results = self.context.diagnostics.run_all()
@@ -2097,10 +2261,10 @@ class MainWindow(QMainWindow):
             mod_id = str(mod["id"])
             enabled = bool(mod["enabled"])
             state = str(mod["state"])
-            if mod_id == "gaming-by-goshkow":
+            if mod_id == "unified-by-goshkow":
                 mod["description"] = self._t(
-                    "Эта модификация направлена на разблокировку самых распространненных проблем в гейминге и других платформах.",
-                    "This mod is aimed at fixing the most common connectivity problems in gaming and other platforms.",
+                    "Позволяет обойти блокировки самых популярных сервисов, включая игровые сервисы, социальные сети и другие платформы.",
+                    "Helps bypass restrictions for the most popular services, including gaming platforms, social networks, and other services.",
                 )
 
             card = QFrame()
@@ -2177,7 +2341,7 @@ class MainWindow(QMainWindow):
             remove_btn.setIconSize(QSize(14, 14))
             remove_btn.clicked.connect(lambda _=False, mid=mod_id: self.context.mods.remove(mid) or self.refresh_all())
             self._attach_button_animations(remove_btn)
-            if mod_id != "gaming-by-goshkow":
+            if mod_id != "unified-by-goshkow":
                 actions.addWidget(remove_btn)
             head.addLayout(actions)
             body.addLayout(head)
