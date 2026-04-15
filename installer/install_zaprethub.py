@@ -150,11 +150,90 @@ def _run_hidden(command: list[str]) -> None:
     subprocess.run(command, check=False, capture_output=True, creationflags=flags, startupinfo=startup)
 
 
-def _terminate_running_instances() -> None:
+def _run_hidden_script(script: str) -> None:
+    startup = None
+    flags = 0
+    if sys.platform.startswith("win"):
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = 0
+    subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", script],
+        check=False,
+        capture_output=True,
+        creationflags=flags,
+        startupinfo=startup,
+    )
+
+
+def _remove_autostart_entries() -> None:
     if not sys.platform.startswith("win"):
         return
+    _run_hidden(["schtasks", "/Delete", "/F", "/TN", "ZapretHub"])
+    ps = r"""
+$paths = @(
+  'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
+  'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
+)
+$names = @('ZapretHub', 'Zapret Hub', 'zapret_hub')
+foreach ($path in $paths) {
+  foreach ($name in $names) {
+    try { Remove-ItemProperty -Path $path -Name $name -ErrorAction SilentlyContinue } catch {}
+  }
+}
+"""
+    _run_hidden_script(ps)
+
+
+def _terminate_running_instances(install_dir: Path | None = None) -> None:
+    if not sys.platform.startswith("win"):
+        return
+    _remove_autostart_entries()
+    _run_hidden(["sc", "stop", "zapret"])
+    _run_hidden(["sc", "delete", "zapret"])
     for image_name in ("zapret_hub.exe", "TgWsProxy_windows.exe", "winws.exe"):
         _run_hidden(["taskkill", "/F", "/T", "/IM", image_name])
+    if install_dir is not None:
+        target = str(install_dir).lower().replace("'", "''")
+        current_pid = os.getpid()
+        ps = f"""
+$needle = '{target}'
+$selfPid = {current_pid}
+Get-CimInstance Win32_Process | ForEach-Object {{
+  if ($_.ProcessId -eq $selfPid) {{ return }}
+  $exe = ''
+  $cmd = ''
+  try {{ $exe = [string]$_.ExecutablePath }} catch {{}}
+  try {{ $cmd = [string]$_.CommandLine }} catch {{}}
+  $joined = ($exe + ' ' + $cmd).ToLowerInvariant()
+  if ($joined.Contains($needle)) {{
+    try {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} catch {{}}
+  }}
+}}
+"""
+        _run_hidden_script(ps)
+        merged_runtime = (install_dir / "merged_runtime").resolve()
+        active_runtime = (merged_runtime / "active_zapret").resolve()
+        ps_handles = f"""
+$paths = @('{str(merged_runtime).lower().replace("'", "''")}', '{str(active_runtime).lower().replace("'", "''")}')
+$selfPid = {current_pid}
+Get-CimInstance Win32_Process | ForEach-Object {{
+  if ($_.ProcessId -eq $selfPid) {{ return }}
+  $exe = ''
+  $cmd = ''
+  try {{ $exe = [string]$_.ExecutablePath }} catch {{}}
+  try {{ $cmd = [string]$_.CommandLine }} catch {{}}
+  $joined = ($exe + ' ' + $cmd).ToLowerInvariant()
+  foreach ($path in $paths) {{
+    if ($joined.Contains($path)) {{
+      try {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} catch {{}}
+      break
+    }}
+  }}
+}}
+"""
+        _run_hidden_script(ps_handles)
     time.sleep(0.35)
 
 
@@ -173,19 +252,61 @@ def _remove_shortcuts() -> None:
             continue
 
 
-def _safe_remove_item(path: Path) -> None:
-    for _ in range(4):
+def _clear_path_attributes(path: Path) -> None:
+    if not sys.platform.startswith("win") or not path.exists():
+        return
+    if path.is_dir():
+        _run_hidden(["cmd", "/c", f'attrib -r -s -h "{path}" /s /d'])
+    else:
+        _run_hidden(["attrib", "-r", "-s", "-h", str(path)])
+
+
+def _schedule_delete_on_reboot(path: Path) -> None:
+    if not sys.platform.startswith("win") or not path.exists():
+        return
+    try:
+        MOVEFILE_DELAY_UNTIL_REBOOT = 0x4
+        ctypes.windll.kernel32.MoveFileExW(str(path), None, MOVEFILE_DELAY_UNTIL_REBOOT)  # type: ignore[attr-defined]
+    except Exception:
+        return
+
+
+def _quarantine_item(path: Path) -> bool:
+    if not path.exists():
+        return True
+    try:
+        quarantine_root = Path(tempfile.gettempdir()) / "zapret_hub_cleanup"
+        quarantine_root.mkdir(parents=True, exist_ok=True)
+        target = quarantine_root / f"{path.name}_{int(time.time() * 1000)}"
+        shutil.move(str(path), str(target))
+        try:
+            _clear_path_attributes(target)
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            elif target.exists():
+                target.unlink(missing_ok=True)
+        finally:
+            if target.exists():
+                _schedule_delete_on_reboot(target)
+        return not path.exists()
+    except Exception:
+        return False
+
+
+def _safe_remove_item(path: Path, install_dir: Path | None = None) -> None:
+    for _ in range(6):
         try:
             if not path.exists():
                 return
+            _clear_path_attributes(path)
             if path.is_dir():
                 shutil.rmtree(path, ignore_errors=False)
             else:
                 path.unlink()
             return
         except PermissionError:
-            _terminate_running_instances()
-            time.sleep(0.25)
+            _terminate_running_instances(install_dir or path.parent)
+            time.sleep(0.45)
         except Exception:
             if path.is_dir():
                 shutil.rmtree(path, ignore_errors=True)
@@ -195,13 +316,32 @@ def _safe_remove_item(path: Path) -> None:
         raise PermissionError(f"cannot replace: {path}")
 
 
+def _wipe_install_dir(install_dir: Path) -> None:
+    if not install_dir.exists():
+        return
+    for _ in range(6):
+        _terminate_running_instances(install_dir)
+        for item in list(install_dir.iterdir()):
+            try:
+                _safe_remove_item(item, install_dir)
+            except Exception:
+                if _quarantine_item(item):
+                    continue
+                raise
+        if not any(install_dir.iterdir()):
+            return
+        time.sleep(0.5)
+    remaining = next((item for item in install_dir.iterdir()), install_dir)
+    raise PermissionError(f"cannot replace: {remaining}")
+
+
 def _write_uninstall_registry(install_dir: Path, uninstaller_exe: Path, app_exe: Path) -> None:
     if not sys.platform.startswith("win"):
         return
     uninstall_cmd = f'"{uninstaller_exe}" --uninstall --install-dir "{install_dir}"'
     values = {
         "DisplayName": "Zapret Hub",
-        "DisplayVersion": "1.0.0",
+        "DisplayVersion": "1.0.1",
         "Publisher": "goshkow",
         "InstallLocation": str(install_dir),
         "DisplayIcon": str(app_exe),
@@ -258,7 +398,15 @@ def _install_dir_from_registry() -> Path | None:
 
 
 def _launch_folder_removal(install_dir: Path) -> None:
-    cmd = f'ping 127.0.0.1 -n 3 > nul & rmdir /s /q "{install_dir}"'
+    cmd = (
+        "@echo off\r\n"
+        ":retry\r\n"
+        f'rmdir /s /q "{install_dir}"\r\n'
+        f'if exist "{install_dir}" (\r\n'
+        "  ping 127.0.0.1 -n 2 > nul\r\n"
+        "  goto retry\r\n"
+        ")\r\n"
+    )
     startup = None
     flags = 0
     if sys.platform.startswith("win"):
@@ -393,7 +541,7 @@ class InstallerWorker(QThread):
                 raise FileNotFoundError(f"payload not found: {payload_zip}")
 
             self.progress.emit(8)
-            _terminate_running_instances()
+            _terminate_running_instances(self.target_dir)
             self.target_dir.mkdir(parents=True, exist_ok=True)
             staging = Path(tempfile.mkdtemp(prefix="zapret_hub_install_"))
             self.progress.emit(18)
@@ -406,10 +554,7 @@ class InstallerWorker(QThread):
             if not source_root.exists():
                 source_root = staging
 
-            for item in list(self.target_dir.iterdir()) if self.target_dir.exists() else []:
-                if item.name.lower() == "logs":
-                    continue
-                _safe_remove_item(item)
+            _wipe_install_dir(self.target_dir)
 
             self.progress.emit(70)
             for item in source_root.iterdir():
@@ -418,7 +563,7 @@ class InstallerWorker(QThread):
                     shutil.copytree(item, dst, dirs_exist_ok=True)
                 else:
                     if dst.exists():
-                        _safe_remove_item(dst)
+                        _safe_remove_item(dst, self.target_dir)
                     shutil.copy2(item, dst)
 
             shutil.rmtree(staging, ignore_errors=True)
@@ -691,7 +836,7 @@ def main() -> int:
             confirm.exec()
             if not confirm.result_yes:
                 return 0
-        _terminate_running_instances()
+        _terminate_running_instances(install_dir)
         _remove_shortcuts()
         _remove_uninstall_registry()
         if install_dir.exists():
