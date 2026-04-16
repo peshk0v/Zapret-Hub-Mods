@@ -12,7 +12,7 @@ import time
 import zipfile
 from pathlib import Path
 
-from PySide6.QtCore import QSize, QThread, Qt, Signal
+from PySide6.QtCore import QSize, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QIcon, QMouseEvent, QShowEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -341,7 +341,7 @@ def _write_uninstall_registry(install_dir: Path, uninstaller_exe: Path, app_exe:
     uninstall_cmd = f'"{uninstaller_exe}" --uninstall --install-dir "{install_dir}"'
     values = {
         "DisplayName": "Zapret Hub",
-        "DisplayVersion": "1.0.1",
+        "DisplayVersion": "1.2.0",
         "Publisher": "goshkow",
         "InstallLocation": str(install_dir),
         "DisplayIcon": str(app_exe),
@@ -422,6 +422,7 @@ class InstallerDialog(QDialog):
         super().__init__(parent)
         self._drag_pos = None
         self._result_yes = False
+        self._result_mode = "cancel"
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setModal(True)
         self.setFixedSize(520, 230)
@@ -467,7 +468,7 @@ class InstallerDialog(QDialog):
         row.addStretch(1)
         if with_yes_no:
             no_btn = QPushButton(tr("Нет", "No"))
-            no_btn.clicked.connect(self.reject)
+            no_btn.clicked.connect(self._accept_no)
             yes_btn = QPushButton(tr("Да", "Yes"))
             yes_btn.setObjectName("primary")
             yes_btn.clicked.connect(self._accept_yes)
@@ -518,20 +519,31 @@ class InstallerDialog(QDialog):
 
     def _accept_yes(self) -> None:
         self._result_yes = True
+        self._result_mode = "yes"
+        self.accept()
+
+    def _accept_no(self) -> None:
+        self._result_yes = False
+        self._result_mode = "no"
         self.accept()
 
     @property
     def result_yes(self) -> bool:
         return self._result_yes
 
+    @property
+    def result_mode(self) -> str:
+        return self._result_mode
+
 
 class InstallerWorker(QThread):
     progress = Signal(int)
     done = Signal(bool, str)
 
-    def __init__(self, target_dir: Path) -> None:
+    def __init__(self, target_dir: Path, preserve_data: bool) -> None:
         super().__init__()
         self.target_dir = target_dir
+        self.preserve_data = preserve_data
 
     def run(self) -> None:
         try:
@@ -554,11 +566,27 @@ class InstallerWorker(QThread):
             if not source_root.exists():
                 source_root = staging
 
-            _wipe_install_dir(self.target_dir)
+            if self.preserve_data:
+                _terminate_running_instances(self.target_dir)
+                preserved_names = {"data", "mods", "configs", "cache"}
+                runtime_leftovers = {"merged_runtime"}
+                for item in source_root.iterdir():
+                    dst = self.target_dir / item.name
+                    if item.name in preserved_names:
+                        continue
+                    if item.name in runtime_leftovers and dst.exists():
+                        _safe_remove_item(dst, self.target_dir)
+                        continue
+                    if dst.exists():
+                        _safe_remove_item(dst, self.target_dir)
+            else:
+                _wipe_install_dir(self.target_dir)
 
             self.progress.emit(70)
             for item in source_root.iterdir():
                 dst = self.target_dir / item.name
+                if self.preserve_data and item.name in {"data", "mods", "configs", "cache"} and dst.exists():
+                    continue
                 if item.is_dir():
                     shutil.copytree(item, dst, dirs_exist_ok=True)
                 else:
@@ -579,6 +607,7 @@ class InstallerWindow(QMainWindow):
         self._drag_pos = None
         self.worker: InstallerWorker | None = None
         self.install_path = default_install_dir()
+        self.preserve_existing_data = True
         self.setWindowTitle("Zapret Hub Installer")
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -737,11 +766,43 @@ class InstallerWindow(QMainWindow):
 
     def _start_install(self) -> None:
         self.install_path = Path(self.path_edit.text().strip() or str(default_install_dir()))
+        if self.install_path.exists():
+            existing_items = [item for item in self.install_path.iterdir()]
+        else:
+            existing_items = []
+        if existing_items:
+            choice = self._ask_existing_install_mode()
+            if choice == "cancel":
+                return
+            self.preserve_existing_data = choice == "preserve"
+        else:
+            self.preserve_existing_data = True
         self.stack.setCurrentWidget(self.page_progress)
-        self.worker = InstallerWorker(self.install_path)
+        self.worker = InstallerWorker(self.install_path, preserve_data=self.preserve_existing_data)
         self.worker.progress.connect(self.bar.setValue)
         self.worker.done.connect(self._on_done)
         self.worker.start()
+
+    def _ask_existing_install_mode(self) -> str:
+        dialog = InstallerDialog(
+            tr("Найдена предыдущая версия", "Existing installation found"),
+            tr(
+                "В выбранной папке уже есть файлы Zapret Hub.\n\n"
+                "Да — обновить программу и сохранить настройки, модификации и конфиги.\n"
+                "Нет — удалить старые данные и установить приложение начисто.",
+                "Zapret Hub files were found in the selected folder.\n\n"
+                "Yes — update the app and keep settings, mods, and configs.\n"
+                "No — remove old data and install a clean copy.",
+            ),
+            with_yes_no=True,
+            parent=self,
+        )
+        dialog.exec()
+        if dialog.result_mode == "yes":
+            return "preserve"
+        if dialog.result_mode == "no":
+            return "clean"
+        return "cancel"
 
     def _on_done(self, ok: bool, error: str) -> None:
         if not ok:
