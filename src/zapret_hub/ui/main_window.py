@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import ctypes
+import time
 import sys
 import threading
 import webbrowser
@@ -8,8 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from zapret_hub import __version__
-from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QIcon, QMouseEvent, QPainter, QPainterPath, QPen
+from zapret_hub.domain import ComponentDefinition, ComponentState
+from PySide6.QtCore import QCoreApplication, QEasingCurve, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal, QPropertyAnimation
+from PySide6.QtGui import QAction, QActionGroup, QColor, QCloseEvent, QIcon, QKeyEvent, QMouseEvent, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -18,6 +20,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -34,11 +37,13 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon,
     QTextEdit,
     QInputDialog,
+    QLayout,
     QProgressBar,
     QToolButton,
     QTreeView,
     QVBoxLayout,
     QWidget,
+    QWidgetItem,
 )
 
 from zapret_hub.bootstrap import ApplicationContext
@@ -69,6 +74,7 @@ class _UiSignals(QObject):
     general_test_done = Signal(object)
     update_check_done = Signal(object, bool)
     update_prepare_done = Signal(object)
+    page_payload_ready = Signal(str, object)
 
 
 class SidebarPanel(QFrame):
@@ -83,6 +89,99 @@ class SidebarPanel(QFrame):
 
     def paintEvent(self, event: QEvent) -> None:
         super().paintEvent(event)
+
+
+class FlowLayout(QLayout):
+    def __init__(self, parent: QWidget | None = None, margin: int = 0, spacing: int = 8) -> None:
+        super().__init__(parent)
+        self._items: list[QWidgetItem] = []
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+
+    def addItem(self, item) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self) -> Qt.Orientations:
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        return size
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        margins = self.contentsMargins()
+        effective = rect.adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom())
+        x = effective.x()
+        y = effective.y()
+        line_height = 0
+        for item in self._items:
+            hint = item.sizeHint()
+            next_x = x + hint.width() + self.spacing()
+            if line_height > 0 and next_x - self.spacing() > effective.right() + 1:
+                x = effective.x()
+                y += line_height + self.spacing()
+                next_x = x + hint.width() + self.spacing()
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + margins.bottom()
+
+
+class ClickableCard(QFrame):
+    clicked = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setProperty("class", "fileModeCard")
+        self.setProperty("hovered", False)
+
+    def enterEvent(self, event: QEvent) -> None:
+        self.setProperty("hovered", True)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        self.setProperty("hovered", False)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 def _disable_native_window_rounding(widget: QWidget) -> None:
@@ -230,6 +329,7 @@ class SettingsDialog(AppDialog):
         self.ipset_mode_combo.addItem("none", "none")
         self.ipset_mode_combo.addItem("any", "any")
         self.game_mode_combo = QComboBox()
+        self.game_mode_combo.addItem(self._t("как в конфиге", "from config"), "auto")
         self.game_mode_combo.addItem(self._t("выключен", "disabled"), "disabled")
         self.game_mode_combo.addItem(self._t("tcp + udp", "tcp + udp"), "all")
         self.game_mode_combo.addItem(self._t("только tcp", "tcp only"), "tcp")
@@ -237,6 +337,7 @@ class SettingsDialog(AppDialog):
         self.autostart_checkbox = QCheckBox(self._t("Запускать вместе с Windows", "Run with Windows"))
         self.tray_checkbox = QCheckBox(self._t("Стартовать в трее", "Start in tray"))
         self.auto_components_checkbox = QCheckBox(self._t("Автозапуск компонентов", "Auto-run components"))
+        self.check_updates_checkbox = QCheckBox(self._t("Проверять наличие обновлений", "Check for updates"))
         form.addRow(self._t("Тема", "Theme"), self.theme_combo)
         form.addRow(self._t("Язык", "Language"), self.language_combo)
         form.addRow(self._t("Хост TG proxy", "TG proxy host"), self.tg_host_input)
@@ -247,6 +348,7 @@ class SettingsDialog(AppDialog):
         form.addRow("", self.autostart_checkbox)
         form.addRow("", self.tray_checkbox)
         form.addRow("", self.auto_components_checkbox)
+        form.addRow("", self.check_updates_checkbox)
         layout.addLayout(form)
 
         credits = QLabel(
@@ -291,6 +393,7 @@ class SettingsDialog(AppDialog):
         self.autostart_checkbox.setChecked(self.context.autostart.is_enabled() or settings.autostart_windows)
         self.tray_checkbox.setChecked(settings.start_in_tray)
         self.auto_components_checkbox.setChecked(settings.auto_run_components)
+        self.check_updates_checkbox.setChecked(settings.check_updates_on_start)
 
     def payload(self) -> dict[str, object]:
         try:
@@ -306,10 +409,11 @@ class SettingsDialog(AppDialog):
             "tg_proxy_port": tg_port,
             "tg_proxy_secret": self.tg_secret_input.text().strip(),
             "zapret_ipset_mode": self.ipset_mode_combo.currentData() or "loaded",
-            "zapret_game_filter_mode": self.game_mode_combo.currentData() or "disabled",
+            "zapret_game_filter_mode": self.game_mode_combo.currentData() or "auto",
             "autostart_windows": self.autostart_checkbox.isChecked(),
             "start_in_tray": self.tray_checkbox.isChecked(),
             "auto_run_components": self.auto_components_checkbox.isChecked(),
+            "check_updates_on_start": self.check_updates_checkbox.isChecked(),
         }
 
 
@@ -342,6 +446,7 @@ class MainWindow(QMainWindow):
         self._ui_signals.general_test_done.connect(self._on_general_test_done)
         self._ui_signals.update_check_done.connect(self._on_update_check_done)
         self._ui_signals.update_prepare_done.connect(self._on_update_prepare_done)
+        self._ui_signals.page_payload_ready.connect(self._on_page_payload_ready)
         self._updating_general_combo = False
         self._pending_info_message: tuple[str, str] | None = None
         self._components_cards_root: QWidget | None = None
@@ -353,10 +458,21 @@ class MainWindow(QMainWindow):
         self._general_loading_label: QLabel | None = None
         self._general_test_dialog: AppDialog | None = None
         self._general_test_status_label: QLabel | None = None
+        self._general_test_eta_label: QLabel | None = None
         self._general_test_progress_bar: QProgressBar | None = None
+        self._general_test_started_at = 0.0
+        self._general_test_current_index = 0
+        self._general_test_total = 0
+        self._general_test_last_progress_at = 0.0
         self._general_test_running = False
         self._general_test_cancelled = False
         self._general_test_show_results = True
+        self._general_test_auto_apply = False
+        self._general_test_eta_timer = QTimer(self)
+        self._general_test_eta_timer.setInterval(1000)
+        self._general_test_eta_timer.timeout.connect(self._update_general_test_eta)
+        self._general_test_task_id: str | None = None
+        self._first_general_prompt: AppDialog | None = None
         self._loading_action = "connect"
         self._tools_btn: QToolButton | None = None
         self._settings_btn: QToolButton | None = None
@@ -371,9 +487,40 @@ class MainWindow(QMainWindow):
         self._logs_refresh_btn: QPushButton | None = None
         self._tray_show_action: QAction | None = None
         self._tray_quit_action: QAction | None = None
+        self._tray_toggle_action: QAction | None = None
+        self._tray_general_menu: QMenu | None = None
+        self._tray_general_action_group: QActionGroup | None = None
         self._update_check_in_progress = False
         self._update_prepare_dialog: AppDialog | None = None
         self._last_prompted_update_version = ""
+        self._file_mode_stack: QStackedWidget | None = None
+        self._file_home_page: QWidget | None = None
+        self._file_tags_page: QWidget | None = None
+        self._file_advanced_page: QWidget | None = None
+        self._file_tag_title: QLabel | None = None
+        self._file_tag_subtitle: QLabel | None = None
+        self._file_tag_input: QLineEdit | None = None
+        self._file_tag_canvas: QWidget | None = None
+        self._file_tag_flow: FlowLayout | None = None
+        self._files_intro_label: QLabel | None = None
+        self._file_mode_cards: list[dict[str, object]] = []
+        self._current_file_collection = "domains"
+        self._favorite_general_buttons: dict[str, QToolButton] = {}
+        self._general_options_cache: list[dict[str, str]] | None = None
+        self._refresh_dirty_sections = {"dashboard", "components", "mods", "files", "logs", "tray"}
+        self._refresh_scheduled = False
+        self._initial_refresh_pending = False
+        self._merge_ensure_in_progress = False
+        self._page_refresh_in_progress: set[str] = set()
+        self._page_payload_cache: dict[str, object] = {}
+        self._settings_dialog: SettingsDialog | None = None
+        self._settings_dialog_signature: tuple[str, str] | None = None
+        self._loading_overlay_fade: QPropertyAnimation | None = None
+        self._loading_overlay_context = ""
+        self._current_file_values_cache: list[str] = []
+        self._backend_tasks: dict[str, str] = {}
+        self._component_defs_cache: dict[str, ComponentDefinition] = {}
+        self._component_states_cache: dict[str, ComponentState] = {}
 
         self._icons_dir = self.context.paths.ui_assets_dir / "icons"
         self._nav_items = [
@@ -395,8 +542,17 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._setup_tray()
         self._apply_theme()
-        self.refresh_all()
+        self._sync_window_icon()
+        self._prime_runtime_snapshot_cache()
+        self.refresh_components()
+        self.refresh_mods()
+        if self.context.backend is not None:
+            self.context.backend.task_finished.connect(self._on_backend_task_finished)
+            self.context.backend.task_failed.connect(self._on_backend_task_failed)
+            self.context.backend.task_progress.connect(self._on_backend_task_progress)
+        self.schedule_refresh_all()
         if not self._launch_hidden:
+            QTimer.singleShot(240, self._prime_cached_dialogs)
             QTimer.singleShot(800, self._maybe_run_first_general_autotest)
             QTimer.singleShot(1400, self._check_updates_on_start)
             QTimer.singleShot(0, lambda: _bring_widget_to_front(self))
@@ -408,13 +564,74 @@ class MainWindow(QMainWindow):
         icon_path = self._icons_dir / filename
         return QIcon(str(icon_path))
 
+    def _component_defs(self) -> dict[str, ComponentDefinition]:
+        if self._component_defs_cache:
+            return dict(self._component_defs_cache)
+        return {component.id: component for component in self.context.processes.list_components()}
+
+    def _component_states(self) -> dict[str, ComponentState]:
+        if self._component_states_cache:
+            return dict(self._component_states_cache)
+        return {state.component_id: state for state in self.context.processes.list_states()}
+
+    def _prime_runtime_snapshot_cache(self) -> None:
+        try:
+            self._component_defs_cache = {
+                component.id: component for component in self.context.processes.list_components()
+            }
+        except Exception:
+            self._component_defs_cache = {}
+        try:
+            self._component_states_cache = {
+                state.component_id: state for state in self.context.processes.list_states()
+            }
+        except Exception:
+            self._component_states_cache = {}
+
+    def _update_runtime_snapshot_from_payload(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        component_items = payload.get("components")
+        if isinstance(component_items, list):
+            snapshot: dict[str, ComponentDefinition] = {}
+            for item in component_items:
+                if isinstance(item, dict) and item.get("id"):
+                    try:
+                        snapshot[str(item["id"])] = ComponentDefinition(**item)
+                    except Exception:
+                        continue
+            if snapshot:
+                self._component_defs_cache = snapshot
+        state_items = payload.get("states")
+        if isinstance(state_items, list):
+            snapshot_states: dict[str, ComponentState] = {}
+            for item in state_items:
+                if isinstance(item, dict) and item.get("component_id"):
+                    try:
+                        snapshot_states[str(item["component_id"])] = ComponentState(**item)
+                    except Exception:
+                        continue
+            if snapshot_states:
+                self._component_states_cache = snapshot_states
+
     def showEvent(self, event: QEvent) -> None:
         super().showEvent(event)
+        self._sync_window_icon()
         _disable_native_window_rounding(self)
         if self._skip_next_show_focus:
             self._skip_next_show_focus = False
             return
         QTimer.singleShot(0, lambda: _bring_widget_to_front(self))
+
+    def _sync_window_icon(self) -> None:
+        icon = self._icon("app.ico")
+        self.setWindowIcon(icon)
+        app = QCoreApplication.instance()
+        if app is not None and hasattr(app, "setWindowIcon"):
+            try:
+                app.setWindowIcon(icon)  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
     def _build_ui(self) -> None:
         shell = QWidget()
@@ -442,6 +659,85 @@ class MainWindow(QMainWindow):
 
         root.addWidget(frame)
         self.setCentralWidget(shell)
+        self._build_loading_overlay(shell)
+
+    def _build_loading_overlay(self, parent: QWidget) -> None:
+        overlay = QFrame(parent)
+        overlay.setObjectName("LoadingOverlay")
+        overlay.hide()
+        layout = QVBoxLayout(overlay)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        layout.addStretch(1)
+        card = QFrame()
+        card.setObjectName("LoadingCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(26, 24, 26, 24)
+        card_layout.setSpacing(10)
+        icon = QLabel()
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setPixmap(self._icon("app.png").pixmap(58, 58))
+        self._loading_overlay_title = QLabel(self._t("Запуск Zapret Hub", "Launching Zapret Hub"))
+        self._loading_overlay_title.setProperty("class", "title")
+        self._loading_overlay_label = QLabel(self._t("Загрузка...", "Loading..."))
+        self._loading_overlay_label.setProperty("class", "muted")
+        self._loading_overlay_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._loading_overlay_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setProperty("class", "loadingLogo")
+        card_layout.addWidget(icon)
+        card_layout.addWidget(self._loading_overlay_title)
+        card_layout.addWidget(self._loading_overlay_label)
+        layout.addWidget(card, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addStretch(1)
+        self._loading_overlay = overlay
+        self._reposition_loading_overlay()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._reposition_loading_overlay()
+
+    def _reposition_loading_overlay(self) -> None:
+        overlay = getattr(self, "_loading_overlay", None)
+        central = self.centralWidget()
+        if overlay is None or central is None:
+            return
+        overlay.setGeometry(0, 0, central.width(), central.height())
+
+    def _show_loading_overlay(self, text: str | None = None, *, title: str | None = None, context: str = "general") -> None:
+        overlay = getattr(self, "_loading_overlay", None)
+        label = getattr(self, "_loading_overlay_label", None)
+        title_label = getattr(self, "_loading_overlay_title", None)
+        if overlay is None:
+            return
+        if self._loading_overlay_fade is not None:
+            self._loading_overlay_fade.stop()
+            self._loading_overlay_fade = None
+        overlay.setGraphicsEffect(None)
+        self._loading_overlay_context = context
+        if title_label is not None and title:
+            title_label.setText(title)
+        if label is not None and text:
+            label.setText(text)
+        self._reposition_loading_overlay()
+        overlay.raise_()
+        overlay.show()
+
+    def _hide_loading_overlay(self) -> None:
+        overlay = getattr(self, "_loading_overlay", None)
+        if overlay is None or not overlay.isVisible():
+            return
+        effect = QGraphicsOpacityEffect(overlay)
+        overlay.setGraphicsEffect(effect)
+        effect.setOpacity(1.0)
+        animation = QPropertyAnimation(effect, b"opacity", overlay)
+        animation.setDuration(220)
+        animation.setStartValue(1.0)
+        animation.setEndValue(0.0)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation.finished.connect(lambda: (overlay.hide(), overlay.setGraphicsEffect(None)))
+        self._loading_overlay_fade = animation
+        animation.start()
+        self._loading_overlay_context = ""
 
     def _build_title_bar(self) -> QWidget:
         bar = QFrame()
@@ -787,14 +1083,165 @@ class MainWindow(QMainWindow):
     def _build_files_page(self) -> QWidget:
         page = QWidget()
         page.setProperty("class", "pageRoot")
-        root = QHBoxLayout(page)
+        root = QVBoxLayout(page)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(12)
+        root.setSpacing(10)
+
+        title = QLabel(self._t("Файлы", "Files"))
+        title.setProperty("class", "title")
+        self._files_title_label = title
+        root.addWidget(title)
+
+        stack = QStackedWidget()
+        self._file_mode_stack = stack
+
+        chooser, chooser_layout = self._card()
+        self._file_home_page = chooser
+        chooser_layout.setContentsMargins(14, 10, 14, 14)
+        chooser_layout.setSpacing(8)
+        intro = QLabel(
+            self._t(
+                "Выберите удобный режим: быстрый список доменов, IP-адреса или полноценное редактирование файлов.",
+                "Choose the mode you need: quick domain/IP editing or full file editing.",
+            )
+        )
+        intro.setWordWrap(True)
+        self._files_intro_label = intro
+        chooser_layout.addWidget(intro)
+        chooser_grid = QGridLayout()
+        chooser_grid.setContentsMargins(0, 2, 0, 0)
+        chooser_grid.setHorizontalSpacing(12)
+        chooser_grid.setVerticalSpacing(12)
+        chooser_layout.addLayout(chooser_grid, 1)
+        file_modes = [
+            (
+                self._t("Домены", "Domains"),
+                self._t("Добавляйте сервисы, которые нужно направить в общий список обхода.", "Add services that should be placed into the general bypass list."),
+                "domains",
+                "files_domains.svg",
+            ),
+            (
+                self._t("Исключения", "Exclude domains"),
+                self._t("Отдельный список доменов, которые нужно исключить из правил.", "A separate list of domains that should be excluded from rules."),
+                "exclude_domains",
+                "files_exclude.svg",
+            ),
+            (
+                self._t("IP-адреса", "IP addresses"),
+                self._t("Ручной список IP и подсетей, которые нужно исключить из IPSet.", "A manual list of IPs and subnets to exclude from IPSet."),
+                "ips",
+                "files_ip.svg",
+            ),
+            (
+                self._t("Редактирование файлов", "Advanced editor"),
+                self._t("Открыть полноценный список файлов и текстовый редактор.", "Open the full file list and the text editor."),
+                "advanced",
+                "files_editor.svg",
+            ),
+        ]
+        self._file_mode_cards = []
+        for index, (label, description, kind, icon_name) in enumerate(file_modes):
+            card = ClickableCard()
+            card.setMinimumHeight(126)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(16, 12, 16, 12)
+            card_layout.setSpacing(8)
+            card_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+            icon_label = QLabel()
+            icon_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            icon_label.setPixmap(self._icon(icon_name).pixmap(28, 28))
+            icon_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            card_layout.addWidget(icon_label)
+
+            title_label = QLabel(label)
+            title_label.setProperty("class", "title")
+            title_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            card_layout.addWidget(title_label)
+
+            desc_label = QLabel(description)
+            desc_label.setProperty("class", "muted")
+            desc_label.setWordWrap(True)
+            desc_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            desc_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            card_layout.addWidget(desc_label, 1)
+
+            card.clicked.connect(lambda target=kind: self._open_files_mode(target))
+            chooser_grid.addWidget(card, index // 2, index % 2)
+            self._file_mode_cards.append(
+                {
+                    "kind": kind,
+                    "title": title_label,
+                    "description": desc_label,
+                }
+            )
+        chooser_grid.setColumnStretch(0, 1)
+        chooser_grid.setColumnStretch(1, 1)
+
+        tags_page, tags_layout = self._card()
+        self._file_tags_page = tags_page
+        back_row = QHBoxLayout()
+        back_btn = QToolButton()
+        back_btn.setProperty("class", "action")
+        back_btn.setIcon(self._icon("back.svg"))
+        back_btn.setIconSize(QSize(16, 16))
+        back_btn.setToolTip(self._t("Назад", "Back"))
+        back_btn.clicked.connect(lambda: self._open_files_mode("home"))
+        back_row.addWidget(back_btn, 0)
+        back_row.addStretch(1)
+        tags_layout.addLayout(back_row)
+        tag_title = QLabel()
+        tag_title.setProperty("class", "title")
+        self._file_tag_title = tag_title
+        tags_layout.addWidget(tag_title)
+        tag_subtitle = QLabel()
+        tag_subtitle.setProperty("class", "muted")
+        tag_subtitle.setWordWrap(True)
+        self._file_tag_subtitle = tag_subtitle
+        tags_layout.addWidget(tag_subtitle)
+        tag_input = QLineEdit()
+        tag_input.setPlaceholderText(self._t("Введите домен или IP и нажмите Enter", "Type a domain or IP and press Enter"))
+        tag_input.returnPressed.connect(self._commit_tag_input)
+        tag_input.installEventFilter(self)
+        self._file_tag_input = tag_input
+        tags_layout.addWidget(tag_input)
+        tag_scroll = QScrollArea()
+        tag_scroll.setWidgetResizable(True)
+        tag_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        tag_canvas = QWidget()
+        tag_flow = FlowLayout(tag_canvas, margin=0, spacing=8)
+        tag_canvas.setLayout(tag_flow)
+        tag_scroll.setWidget(tag_canvas)
+        self._file_tag_canvas = tag_canvas
+        self._file_tag_flow = tag_flow
+        tags_layout.addWidget(tag_scroll, 1)
+        advanced_btn = QPushButton(self._t("Открыть редактор файлов", "Open file editor"))
+        advanced_btn.clicked.connect(lambda: self._open_files_mode("advanced"))
+        tags_layout.addWidget(advanced_btn)
+
+        advanced_page = QWidget()
+        self._file_advanced_page = advanced_page
+        advanced_root = QVBoxLayout(advanced_page)
+        advanced_root.setContentsMargins(0, 0, 0, 0)
+        advanced_root.setSpacing(12)
+        advanced_top = QHBoxLayout()
+        advanced_back = QToolButton()
+        advanced_back.setProperty("class", "action")
+        advanced_back.setIcon(self._icon("back.svg"))
+        advanced_back.setIconSize(QSize(16, 16))
+        advanced_back.setToolTip(self._t("Назад", "Back"))
+        advanced_back.clicked.connect(lambda: self._open_files_mode("home"))
+        advanced_top.addWidget(advanced_back, 0)
+        advanced_top.addStretch(1)
+        advanced_root.addLayout(advanced_top)
+        advanced_split = QHBoxLayout()
+        advanced_split.setContentsMargins(0, 0, 0, 0)
+        advanced_split.setSpacing(12)
 
         left, left_layout = self._card()
-        left_title = QLabel(self._t("Файлы", "Files"))
+        left_title = QLabel(self._t("Список файлов", "Files list"))
         left_title.setProperty("class", "title")
-        self._files_title_label = left_title
         left_layout.addWidget(left_title)
         self.files_list = QListWidget()
         self.files_list.setObjectName("FilesList")
@@ -803,7 +1250,7 @@ class MainWindow(QMainWindow):
         self.files_list.setSpacing(8)
         self.files_list.currentItemChanged.connect(self._load_selected_file)
         left_layout.addWidget(self.files_list)
-        root.addWidget(left, 1)
+        advanced_split.addWidget(left, 1)
 
         right, right_layout = self._card()
         right_title = QLabel(self._t("Редактор", "Editor"))
@@ -829,7 +1276,13 @@ class MainWindow(QMainWindow):
         save_btn.clicked.connect(self._save_current_file)
         self._attach_button_animations(save_btn)
         right_layout.addWidget(save_btn)
-        root.addWidget(right, 2)
+        advanced_split.addWidget(right, 2)
+        advanced_root.addLayout(advanced_split, 1)
+
+        stack.addWidget(chooser)
+        stack.addWidget(tags_page)
+        stack.addWidget(advanced_page)
+        root.addWidget(stack, 1)
         return page
 
     def _build_logs_page(self) -> QWidget:
@@ -859,17 +1312,26 @@ class MainWindow(QMainWindow):
         self.tray_icon = QSystemTrayIcon(self._icon("app.ico"), self)
         menu = QMenu(self)
         show_action = QAction(self._t("Открыть", "Open"), self)
+        toggle_action = QAction(self._t("Компоненты", "Components"), self)
+        general_menu = QMenu(self._t("Конфигурация Zapret", "Zapret configuration"), self)
         quit_action = QAction(self._t("Выход", "Exit"), self)
         show_action.triggered.connect(self._restore_from_tray)
+        toggle_action.triggered.connect(self._tray_toggle_master_runtime)
         quit_action.triggered.connect(self._exit_application)
         self._tray_show_action = show_action
+        self._tray_toggle_action = toggle_action
+        self._tray_general_menu = general_menu
         self._tray_quit_action = quit_action
         menu.addAction(show_action)
+        menu.addAction(toggle_action)
+        menu.addMenu(general_menu)
+        menu.addSeparator()
         menu.addAction(quit_action)
         self.tray_icon.setContextMenu(menu)
         self.tray_icon.activated.connect(self._on_tray_activated)
         self.tray_icon.setToolTip("Zapret Hub")
         self.tray_icon.show()
+        self._rebuild_tray_menu()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton and event.position().y() <= 48:
@@ -899,28 +1361,64 @@ class MainWindow(QMainWindow):
                     self._tray_notifications_shown = True
                 return
             self._force_exit = True
-        self._shutdown_runtime()
+            self.hide()
+            event.ignore()
+            QTimer.singleShot(0, self._finalize_exit)
+            return
         event.accept()
-        app = QCoreApplication.instance()
-        if app is not None:
-            QTimer.singleShot(0, app.quit)
         super().closeEvent(event)
 
     def _restore_from_tray(self) -> None:
-        self.refresh_all()
+        self._sync_window_icon()
         self.showNormal()
+        self._mark_dirty("dashboard", "components", "mods", "files", "logs", "tray")
         _bring_widget_to_front(self)
+
+    def _tray_toggle_master_runtime(self) -> None:
+        if self._toggle_in_progress:
+            return
+        self._toggle_master_runtime()
+
+    def start_enabled_components_async(self) -> None:
+        if self._toggle_in_progress:
+            return
+        self._loading_action = "connect"
+        self._toggle_in_progress = True
+        self._loading_timer.start()
+        self._advance_loading_caption()
+        self._submit_backend_task("start_enabled_components")
+
+    def _tray_select_general(self, general_id: str) -> None:
+        if not general_id:
+            return
+        current = self.context.settings.get().selected_zapret_general
+        if general_id == current:
+            return
+        self.context.settings.get().selected_zapret_general = general_id
+        states = self._component_states()
+        if states.get("zapret") and states["zapret"].status == "running":
+            self._toggle_in_progress = True
+            self._loading_action = "connect"
+            self._loading_timer.start()
+            self._advance_loading_caption()
+            self._submit_backend_task("select_general", {"selected": general_id})
+        else:
+            self._submit_backend_task("select_general", {"selected": general_id})
+            self.refresh_all()
 
     def restore_from_external_launch(self) -> None:
         self._restore_from_tray()
 
     def _exit_application(self) -> None:
         self._force_exit = True
+        self.hide()
+        QTimer.singleShot(0, self._finalize_exit)
+
+    def _finalize_exit(self) -> None:
         self._shutdown_runtime()
-        self.close()
         app = QCoreApplication.instance()
         if app is not None:
-            QTimer.singleShot(0, app.quit)
+            app.quit()
 
     def _shutdown_runtime(self) -> None:
         if self._shutdown_started:
@@ -928,6 +1426,7 @@ class MainWindow(QMainWindow):
         self._shutdown_started = True
         self._loading_timer.stop()
         self._component_loading_timer.stop()
+        self._general_test_eta_timer.stop()
         self._general_test_running = False
         try:
             self.context.processes.stop_all()
@@ -945,10 +1444,43 @@ class MainWindow(QMainWindow):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self._restore_from_tray()
 
+    def _rebuild_tray_menu(self) -> None:
+        if self._tray_general_menu is None:
+            return
+        self._tray_general_menu.clear()
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        selected = self.context.settings.get().selected_zapret_general
+        for option in self._sorted_general_options():
+            action = QAction(self._format_general_option_label(option), self)
+            action.setCheckable(True)
+            action.setChecked(option["id"] == selected)
+            action.triggered.connect(lambda _=False, gid=option["id"]: self._tray_select_general(gid))
+            group.addAction(action)
+            self._tray_general_menu.addAction(action)
+        self._tray_general_action_group = group
+        states = self._component_states()
+        active_ids = self._master_active_components()
+        running_ids = {cid for cid in active_ids if states.get(cid) and states[cid].status == "running"}
+        if self._tray_toggle_action is not None:
+            fully_running = bool(active_ids) and running_ids == set(active_ids)
+            partially_running = bool(running_ids) and not fully_running
+            if fully_running:
+                icon_name = "status_ok.svg"
+                state_text = self._t("Включены", "Enabled")
+            elif partially_running:
+                icon_name = "status_warn.svg"
+                state_text = self._t("Частично", "Partial")
+            else:
+                icon_name = "status_off.svg"
+                state_text = self._t("Выключены", "Disabled")
+            self._tray_toggle_action.setIcon(self._icon(icon_name))
+            self._tray_toggle_action.setText(f"{self._t('Компоненты', 'Components')}: {state_text}")
+
     def _should_minimize_to_tray(self) -> bool:
         # в трей уходим только когда реально есть активный runtime
         try:
-            states = {state.component_id: state for state in self.context.processes.list_states()}
+            states = self._component_states()
         except Exception:
             return False
         for component_id in ("zapret", "tg-ws-proxy"):
@@ -965,6 +1497,10 @@ class MainWindow(QMainWindow):
         return
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self._file_tag_input and isinstance(event, QKeyEvent) and event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Comma, Qt.Key.Key_Semicolon):
+                self._commit_tag_input()
+                return True
         return super().eventFilter(watched, event)
 
     def _switch_page(self, index: int) -> None:
@@ -972,48 +1508,141 @@ class MainWindow(QMainWindow):
             btn.setChecked(i == index)
         if index != self.pages.currentIndex():
             self.pages.setCurrentIndex(index)
+        section_map = {
+            0: "dashboard",
+            1: "components",
+            2: "mods",
+            3: "files",
+            4: "logs",
+        }
+        section = section_map.get(index)
+        if section:
+            self._mark_dirty(section)
+        else:
+            self._schedule_dirty_refresh()
 
 
     def _open_settings_dialog(self) -> None:
-        dialog = SettingsDialog(self, self.context)
+        signature = (self.context.settings.get().theme, self.context.settings.get().language)
+        if self._settings_dialog is None or self._settings_dialog_signature != signature:
+            if self._settings_dialog is not None:
+                self._settings_dialog.deleteLater()
+            self._settings_dialog = SettingsDialog(self, self.context)
+            self._settings_dialog_signature = signature
+        dialog = self._settings_dialog
+        dialog._load()
         dialog.prepare_and_center()
         if dialog.exec():
             before = self.context.settings.get()
-            tg_before = (before.tg_proxy_host, int(before.tg_proxy_port), before.tg_proxy_secret)
-            zapret_before = (before.zapret_ipset_mode, before.zapret_game_filter_mode, before.selected_zapret_general)
             payload = dialog.payload()
-            self.context.settings.update(**payload)
-            self.context.autostart.set_enabled(bool(payload["autostart_windows"]))
-            tg_after = (str(payload["tg_proxy_host"]), int(payload["tg_proxy_port"]), str(payload["tg_proxy_secret"]))
-            zapret_after = (
-                str(payload.get("zapret_ipset_mode", "loaded")),
-                str(payload.get("zapret_game_filter_mode", "disabled")),
-                self.context.settings.get().selected_zapret_general,
+            if signature != (str(payload["theme"]), str(payload["language"])):
+                self._settings_dialog = None
+                self._settings_dialog_signature = None
+            QTimer.singleShot(0, lambda p=payload, b=before: self._apply_settings_payload(b, p))
+
+    def _apply_settings_payload(self, before, payload: dict[str, object]) -> None:
+        self._submit_backend_task("apply_settings", payload, action_id="__settings__")
+
+    def _prime_cached_dialogs(self) -> None:
+        if self._launch_hidden:
+            return
+        signature = (self.context.settings.get().theme, self.context.settings.get().language)
+        if self._settings_dialog is None or self._settings_dialog_signature != signature:
+            self._settings_dialog = SettingsDialog(self, self.context)
+            self._settings_dialog_signature = signature
+
+    def _submit_backend_task(self, action: str, payload: dict[str, object] | None = None, *, action_id: str | None = None) -> str:
+        if self.context.backend is None:
+            raise RuntimeError("Backend worker is not available")
+        task_id = self.context.backend.submit(action, payload or {})
+        self._backend_tasks[task_id] = action_id or action
+        return task_id
+
+    def _on_backend_task_finished(self, message: dict) -> None:
+        task_id = str(message.get("id", ""))
+        action = str(message.get("action", ""))
+        action_id = self._backend_tasks.pop(task_id, action)
+        payload = message.get("payload", {})
+        self.context.settings.reload()
+        self._update_runtime_snapshot_from_payload(payload)
+        if action in {"toggle_mod", "apply_settings", "select_general", "toggle_component_enabled"}:
+            self._invalidate_general_options_cache()
+            self._page_payload_cache.clear()
+        if action == "apply_settings":
+            if bool(payload.get("autostart_changed")):
+                self.context.autostart.set_enabled(bool(self.context.settings.get().autostart_windows))
+            if bool(payload.get("theme_changed")):
+                self._apply_theme()
+            if bool(payload.get("language_changed")):
+                self._retranslate_ui()
+            self._mark_dirty("dashboard", "components", "mods", "files", "logs", "tray")
+        if action in {"toggle_master_runtime", "start_enabled_components", "select_general"}:
+            self._mark_dirty("dashboard", "components", "tray")
+            self._ui_signals.toggle_done.emit()
+            if action == "select_general":
+                self._ui_signals.component_action_done.emit("__general__")
+            return
+        if action == "apply_settings":
+            self._ui_signals.component_action_done.emit("__settings__")
+            return
+        if action == "toggle_component_enabled":
+            self._mark_dirty("dashboard", "components", "tray")
+            self._ui_signals.component_action_done.emit(action_id)
+            return
+        if action == "toggle_component_autostart":
+            self._mark_dirty("components")
+            self._ui_signals.component_action_done.emit(action_id)
+            return
+        if action == "toggle_mod":
+            self._mark_dirty("dashboard", "mods", "files", "logs", "tray")
+            return
+        if action == "restart_zapret_if_running":
+            self._mark_dirty("dashboard", "components", "tray")
+            return
+        if action == "run_general_diagnostics":
+            self._ui_signals.general_test_done.emit(payload.get("results", []))
+
+    def _on_backend_task_failed(self, message: dict) -> None:
+        task_id = str(message.get("id", ""))
+        action = str(message.get("action", ""))
+        action_id = self._backend_tasks.pop(task_id, action)
+        error = str(message.get("error", self._t("Неизвестная ошибка.", "Unknown error.")))
+        if action in {"toggle_master_runtime", "start_enabled_components", "select_general"}:
+            self._ui_signals.toggle_done.emit()
+            if action == "select_general":
+                self._ui_signals.component_action_done.emit("__general__")
+        if action == "apply_settings":
+            self._ui_signals.component_action_done.emit("__settings__")
+        if action in {"toggle_component_enabled", "toggle_component_autostart"}:
+            self._ui_signals.component_action_done.emit(action_id)
+        if action == "run_general_diagnostics":
+            self._general_test_running = False
+            self._general_test_task_id = None
+            self._general_test_eta_timer.stop()
+            if self._general_test_dialog is not None:
+                self._general_test_dialog.reject()
+            self._general_test_dialog = None
+            self._general_test_status_label = None
+            self._general_test_eta_label = None
+            self._general_test_progress_bar = None
+        self._show_error("Zapret Hub", error)
+
+    def _on_backend_task_progress(self, message: dict) -> None:
+        action = str(message.get("action", ""))
+        payload = message.get("payload", {})
+        if action == "run_general_diagnostics" and isinstance(payload, dict):
+            self._ui_signals.general_test_progress.emit(
+                int(payload.get("current", 0) or 0),
+                int(payload.get("total", 0) or 0),
+                str(payload.get("name", "") or ""),
             )
-            if tg_before != tg_after:
-                states = {s.component_id: s for s in self.context.processes.list_states()}
-                tg_running = states.get("tg-ws-proxy") and states["tg-ws-proxy"].status == "running"
-                if tg_running:
-                    self.context.processes.stop_component("tg-ws-proxy")
-                    self.context.processes.start_component("tg-ws-proxy")
-            if zapret_before != zapret_after:
-                states = {s.component_id: s for s in self.context.processes.list_states()}
-                zapret_running = states.get("zapret") and states["zapret"].status == "running"
-                if zapret_running:
-                    self.context.processes.stop_component("zapret")
-                    self.context.processes.start_component("zapret")
-            self._apply_theme()
-            self._retranslate_ui()
-            self.refresh_all()
 
     def _apply_theme(self) -> None:
         theme = self.context.settings.get().theme
         chevron = str((self._icons_dir / "chevron_down.svg").resolve())
         check = str((self._icons_dir / "check.svg").resolve())
         self.setStyleSheet(build_stylesheet(theme, chevron_icon=chevron, check_icon=check))
-        if hasattr(self, "power_button") and self.power_button is not None:
-            power_icon = "power_dark.svg" if theme == "dark" else "power_light.svg"
-            self.power_button.setIcon(self._icon(power_icon))
+        self._update_power_icon()
         sidebar = self.findChild(SidebarPanel, "Sidebar")
         if sidebar is not None:
             sidebar.set_theme(theme)
@@ -1025,6 +1654,20 @@ class MainWindow(QMainWindow):
         suffix = "dark" if theme == "dark" else "light"
         self._min_btn.setIcon(self._icon(f"window_min_{suffix}.svg"))
         self._close_btn.setIcon(self._icon(f"window_close_{suffix}.svg"))
+
+    def _theme_status_icon_name(self) -> str:
+        return "status_sun.svg" if self.context.settings.get().theme == "light" else "status_theme.svg"
+
+    def _update_power_icon(self) -> None:
+        if not hasattr(self, "power_button") or self.power_button is None:
+            return
+        theme = self.context.settings.get().theme
+        state = str(self.power_button.property("state") or "off")
+        if self._toggle_in_progress or state != "off" or theme == "dark":
+            power_icon = "power_dark.svg"
+        else:
+            power_icon = "power_light.svg"
+        self.power_button.setIcon(self._icon(power_icon))
 
     def _retranslate_ui(self) -> None:
         nav_tooltips = [
@@ -1068,6 +1711,54 @@ class MainWindow(QMainWindow):
             )
         if self._files_title_label is not None:
             self._files_title_label.setText(self._t("Файлы", "Files"))
+        if self._files_intro_label is not None:
+            self._files_intro_label.setText(
+                self._t(
+                    "Выберите удобный режим: быстрый список доменов, IP-адреса или полноценное редактирование файлов.",
+                    "Choose the mode you need: quick domain/IP editing or full file editing.",
+                )
+            )
+        file_mode_texts = {
+            "domains": (
+                self._t("Домены", "Domains"),
+                self._t(
+                    "Добавляйте сервисы, которые нужно направить в общий список обхода.",
+                    "Add services that should be placed into the general bypass list.",
+                ),
+            ),
+            "exclude_domains": (
+                self._t("Исключения", "Exclude domains"),
+                self._t(
+                    "Отдельный список доменов, которые нужно исключить из правил.",
+                    "A separate list of domains that should be excluded from rules.",
+                ),
+            ),
+            "ips": (
+                self._t("IP-адреса", "IP addresses"),
+                self._t(
+                    "Ручной список IP и подсетей, которые нужно исключить из IPSet.",
+                    "A manual list of IPs and subnets to exclude from IPSet.",
+                ),
+            ),
+            "advanced": (
+                self._t("Редактирование файлов", "Advanced editor"),
+                self._t(
+                    "Открыть полноценный список файлов и текстовый редактор.",
+                    "Open the full file list and the text editor.",
+                ),
+            ),
+        }
+        for entry in self._file_mode_cards:
+            kind = str(entry.get("kind", ""))
+            title_desc = file_mode_texts.get(kind)
+            if not title_desc:
+                continue
+            title_label = entry.get("title")
+            desc_label = entry.get("description")
+            if isinstance(title_label, QLabel):
+                title_label.setText(title_desc[0])
+            if isinstance(desc_label, QLabel):
+                desc_label.setText(title_desc[1])
         if self._editor_title_label is not None:
             self._editor_title_label.setText(self._t("Редактор", "Editor"))
         if self._logs_title_label is not None:
@@ -1091,18 +1782,55 @@ class MainWindow(QMainWindow):
 
         if self._tray_show_action is not None:
             self._tray_show_action.setText(self._t("Открыть", "Open"))
+        if self._tray_toggle_action is not None:
+            self._tray_toggle_action.setText(self._t("Компоненты", "Components"))
+        if self._tray_general_menu is not None:
+            self._tray_general_menu.setTitle(self._t("Конфигурация Zapret", "Zapret configuration"))
         if self._tray_quit_action is not None:
             self._tray_quit_action.setText(self._t("Выход", "Exit"))
 
-        if self.files_list.currentItem() is None:
+        if hasattr(self, "files_list") and self.files_list.currentItem() is None:
             self.file_path_label.setText(self._t("Выберите файл", "Select a file"))
 
+        self._rebuild_tray_menu()
+
     def _format_general_option_label(self, option: dict[str, str]) -> str:
+        favorite = str(option.get("id", "")) in self._favorite_general_ids()
         bundle = (option.get("bundle") or "").strip()
         name = option.get("name", "").strip()
-        if not bundle:
-            return name
-        return f"({bundle}) {name}"
+        label = name if not bundle else f"({bundle}) {name}"
+        return f"★ {label}" if favorite else label
+
+    def _favorite_general_ids(self) -> list[str]:
+        return list(self.context.settings.get().favorite_zapret_generals or [])
+
+    def _is_general_favorite(self, general_id: str) -> bool:
+        return general_id in set(self._favorite_general_ids())
+
+    def _set_general_favorite(self, general_id: str, favorite: bool) -> None:
+        favorites = [item for item in self._favorite_general_ids() if item]
+        if favorite and general_id not in favorites:
+            favorites.append(general_id)
+        if not favorite:
+            favorites = [item for item in favorites if item != general_id]
+        self.context.settings.update(favorite_zapret_generals=favorites)
+
+    def _invalidate_general_options_cache(self) -> None:
+        self._general_options_cache = None
+
+    def _sorted_general_options(self) -> list[dict[str, str]]:
+        if self._general_options_cache is None:
+            self._general_options_cache = self.context.processes.list_zapret_generals()
+        options = list(self._general_options_cache)
+        favorites = {item for item in self._favorite_general_ids() if item}
+        return sorted(
+            options,
+            key=lambda item: (
+                0 if item["id"] in favorites else 1,
+                (item.get("bundle") or "").lower(),
+                (item.get("name") or "").lower(),
+            ),
+        )
 
     def _start_component_loading(self, component_id: str, button: QPushButton, base_text: str) -> None:
         self._component_loading_buttons[component_id] = button
@@ -1160,6 +1888,109 @@ class MainWindow(QMainWindow):
             return None
         return item.data(Qt.ItemDataRole.UserRole)
 
+    def _open_files_mode(self, mode: str) -> None:
+        if self._file_mode_stack is None:
+            return
+        if mode == "home":
+            self._file_mode_stack.setCurrentIndex(0)
+            return
+        if mode == "advanced":
+            self._file_mode_stack.setCurrentIndex(2)
+            self._mark_dirty("files")
+            return
+        self._current_file_collection = mode
+        self._refresh_file_collection_view()
+        self._file_mode_stack.setCurrentIndex(1)
+
+    def _refresh_file_collection_view(self) -> None:
+        self._refresh_file_collection_view_with_values(None)
+
+    def _refresh_file_collection_view_with_values(self, values: list[str] | None) -> None:
+        titles = {
+            "domains": (
+                self._t("Домены", "Domains"),
+                self._t(
+                    "Добавляйте домены, которые нужно включить в пользовательский список обхода.",
+                    "Add domains that should be included in the user bypass list.",
+                ),
+            ),
+            "exclude_domains": (
+                self._t("Исключения", "Exclude domains"),
+                self._t(
+                    "Здесь можно указать домены, которые нужно исключить из правил Zapret.",
+                    "Here you can list domains that should be excluded from Zapret rules.",
+                ),
+            ),
+            "ips": (
+                self._t("IP-адреса", "IP addresses"),
+                self._t(
+                    "Добавляйте IP-адреса и подсети, которые нужно исключить из IPSet.",
+                    "Add IP addresses and subnets that should be excluded from IPSet.",
+                ),
+            ),
+        }
+        title, subtitle = titles.get(self._current_file_collection, (self._t("Файлы", "Files"), ""))
+        if self._file_tag_title is not None:
+            self._file_tag_title.setText(title)
+        if self._file_tag_subtitle is not None:
+            self._file_tag_subtitle.setText(subtitle)
+        if self._file_tag_input is not None:
+            placeholder = self._t("Введите значение и нажмите Enter", "Type a value and press Enter")
+            self._file_tag_input.setPlaceholderText(placeholder)
+            self._file_tag_input.clear()
+        self._render_file_tags(values)
+
+    def _render_file_tags(self, values: list[str] | None = None) -> None:
+        if self._file_tag_flow is None:
+            return
+        while self._file_tag_flow.count():
+            item = self._file_tag_flow.takeAt(0)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widget.deleteLater()
+        resolved_values = list(values if values is not None else self.context.files.read_collection(self._current_file_collection))
+        self._current_file_values_cache = resolved_values
+        for value in resolved_values:
+            chip = QFrame()
+            chip.setProperty("class", "modMeta")
+            chip_layout = QHBoxLayout(chip)
+            chip_layout.setContentsMargins(10, 6, 8, 6)
+            chip_layout.setSpacing(8)
+            label = QLabel(value)
+            remove_btn = QToolButton()
+            remove_btn.setProperty("class", "action")
+            remove_btn.setText("×")
+            remove_btn.clicked.connect(lambda _=False, item=value: self._remove_file_tag(item))
+            chip_layout.addWidget(label)
+            chip_layout.addWidget(remove_btn)
+            self._file_tag_flow.addWidget(chip)
+        if self._file_tag_canvas is not None:
+            self._file_tag_canvas.adjustSize()
+
+    def _commit_tag_input(self) -> None:
+        if self._file_tag_input is None:
+            return
+        raw = self._file_tag_input.text().strip()
+        if not raw:
+            return
+        self.context.files.add_collection_values(self._current_file_collection, raw)
+        self._file_tag_input.clear()
+        self._render_file_tags()
+        self._restart_zapret_if_running()
+
+    def _remove_file_tag(self, value: str) -> None:
+        self.context.files.remove_collection_value(self._current_file_collection, value)
+        self._render_file_tags()
+        self._restart_zapret_if_running()
+
+    def _restart_zapret_if_running(self) -> None:
+        try:
+            states = self._component_states()
+            if states.get("zapret") and states["zapret"].status == "running":
+                self._submit_backend_task("restart_zapret_if_running")
+        except Exception:
+            return
+
     def _selected_file_path(self) -> str | None:
         item = self.files_list.currentItem()
         if item is None:
@@ -1169,7 +2000,7 @@ class MainWindow(QMainWindow):
     def _toggle_master_runtime(self) -> None:
         if self._toggle_in_progress:
             return
-        states = {s.component_id: s for s in self.context.processes.list_states()}
+        states = self._component_states()
         active_ids = self._master_active_components()
         running_ids = {cid for cid in active_ids if states.get(cid) and states[cid].status == "running"}
         self._loading_action = "disconnect" if active_ids and running_ids == set(active_ids) else "connect"
@@ -1178,12 +2009,11 @@ class MainWindow(QMainWindow):
         self._loading_frame = 0
         self._loading_timer.start()
         self._advance_loading_caption()
-        thread = threading.Thread(target=self._toggle_master_runtime_worker, daemon=True)
-        thread.start()
+        self._submit_backend_task("toggle_master_runtime")
 
     def _toggle_master_runtime_worker(self) -> None:
         try:
-            states = {s.component_id: s for s in self.context.processes.list_states()}
+            states = self._component_states()
             active_ids = self._master_active_components()
             if not active_ids:
                 return
@@ -1202,6 +2032,7 @@ class MainWindow(QMainWindow):
         self._loading_timer.stop()
         self._toggle_in_progress = False
         self.power_button.setEnabled(True)
+        self._update_power_icon()
         self.refresh_all()
         if self._pending_info_message is not None:
             title, text = self._pending_info_message
@@ -1215,6 +2046,10 @@ class MainWindow(QMainWindow):
         frames = [base, f"{base}.", f"{base}..", f"{base}..."]
         self.power_caption.setText(frames[self._loading_frame % len(frames)])
         self._loading_frame += 1
+        self.power_button.setProperty("state", "on")
+        self.power_button.style().unpolish(self.power_button)
+        self.power_button.style().polish(self.power_button)
+        self._update_power_icon()
 
     def _start_selected_component(self) -> None:
         component_id = self._selected_component_id()
@@ -1231,30 +2066,27 @@ class MainWindow(QMainWindow):
     def _toggle_selected_component_enabled(self) -> None:
         component_id = self._selected_component_id()
         if component_id:
-            self.context.processes.toggle_component_enabled(component_id)
-            self.refresh_all()
+            self._submit_backend_task("toggle_component_enabled", {"component_id": component_id}, action_id=component_id)
 
     def _toggle_selected_component_autostart(self) -> None:
         component_id = self._selected_component_id()
         if component_id:
-            self.context.processes.toggle_component_autostart(component_id)
-            self.refresh_all()
+            self._submit_backend_task("toggle_component_autostart", {"component_id": component_id}, action_id=component_id)
 
     def _toggle_component_card(self, component_id: str, button: QPushButton) -> None:
         if component_id in self._component_loading_buttons:
             return
         self._start_component_loading(component_id, button, button.text())
-        thread = threading.Thread(target=self._toggle_component_card_worker, args=(component_id,), daemon=True)
-        thread.start()
+        self._submit_backend_task("toggle_component_enabled", {"component_id": component_id}, action_id=component_id)
 
     def _toggle_component_card_worker(self, component_id: str) -> None:
-        self.context.processes.toggle_component_enabled(component_id)
-        self._ui_signals.component_action_done.emit(component_id)
+        self._submit_backend_task("toggle_component_enabled", {"component_id": component_id}, action_id=component_id)
 
     def _install_selected_mod(self) -> None:
         mod_id = self._selected_mod_id()
         if mod_id:
             self.context.mods.install(mod_id)
+            self._invalidate_general_options_cache()
             self.refresh_all()
 
     def _toggle_selected_mod(self) -> None:
@@ -1265,13 +2097,13 @@ class MainWindow(QMainWindow):
         if mod_id not in installed:
             self._show_info(self._t("Модификация", "Mod"), self._t("Сначала установите модификацию, затем включайте её.", "Install selected mod before enabling it."))
             return
-        self.context.mods.set_enabled(mod_id, not installed[mod_id].enabled)
-        self.refresh_all()
+        self._submit_backend_task("toggle_mod", {"mod_id": mod_id}, action_id=f"mod:{mod_id}")
 
     def _remove_selected_mod(self) -> None:
         mod_id = self._selected_mod_id()
         if mod_id:
             self.context.mods.remove(mod_id)
+            self._invalidate_general_options_cache()
             self.refresh_all()
 
     def _import_mod_any(self) -> None:
@@ -1354,6 +2186,7 @@ class MainWindow(QMainWindow):
                 return
             try:
                 self.context.mods.import_from_github(repo_url)
+                self._invalidate_general_options_cache()
                 self.refresh_all()
             except Exception as error:
                 self._show_error(self._t("Модификации", "Mods"), f"{self._t('Не удалось импортировать репозиторий', 'Failed to import repository')}:\n{error}")
@@ -1363,6 +2196,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self.context.mods.import_from_paths(paths)
+            self._invalidate_general_options_cache()
             self.refresh_all()
         except Exception as error:
             self._show_error(self._t("Модификации", "Mods"), f"{self._t('Не удалось импортировать модификацию', 'Failed to import modification')}:\n{error}")
@@ -1373,6 +2207,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self.context.mods.import_from_path(path)
+            self._invalidate_general_options_cache()
             self.refresh_all()
         except Exception as error:
             self._show_error(self._t("Модификации", "Mods"), f"{self._t('Не удалось импортировать папку', 'Failed to import folder')}:\n{error}")
@@ -1383,13 +2218,19 @@ class MainWindow(QMainWindow):
             return
         try:
             self.context.mods.import_from_path(path)
+            self._invalidate_general_options_cache()
             self.refresh_all()
         except Exception as error:
             self._show_error(self._t("Модификации", "Mods"), f"{self._t('Не удалось импортировать архив', 'Failed to import archive')}:\n{error}")
 
     def _rebuild_runtime(self) -> None:
-        self.context.merge.rebuild()
-        self.refresh_all()
+        def _worker() -> None:
+            try:
+                self.context.merge.rebuild()
+            finally:
+                self._ui_signals.component_action_done.emit("__merge_rebuild__")
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _check_updates_popup(self) -> None:
         self._start_update_check(manual=True)
@@ -1409,7 +2250,23 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _run_update_check_worker(self, manual: bool) -> None:
-        release = self.context.updates.fetch_latest_application_release()
+        restart_zapret = False
+        try:
+            states = self._component_states()
+            restart_zapret = bool(states.get("zapret") and states["zapret"].status == "running")
+        except Exception:
+            restart_zapret = False
+
+        try:
+            if restart_zapret:
+                self.context.processes.stop_component("zapret")
+            release = self.context.updates.fetch_latest_application_release()
+        finally:
+            if restart_zapret:
+                try:
+                    self.context.processes.start_component("zapret")
+                except Exception:
+                    pass
         self._ui_signals.update_check_done.emit(release, manual)
 
     def _on_update_check_done(self, release: object, manual: bool) -> None:
@@ -1581,18 +2438,113 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self._show_error(self._t("Файлы", "Files"), f"{self._t('Не удалось переименовать файл', 'Failed to rename file')}:\n{error}")
 
+    def schedule_refresh_all(self) -> None:
+        self._refresh_dirty_sections.update({"dashboard", "components", "mods", "files", "logs", "tray"})
+        self._schedule_dirty_refresh()
+
+    def _mark_dirty(self, *sections: str) -> None:
+        self._refresh_dirty_sections.update(sections)
+        self._schedule_dirty_refresh()
+
+    def _schedule_dirty_refresh(self) -> None:
+        if self._refresh_scheduled:
+            return
+        self._refresh_scheduled = True
+        QTimer.singleShot(0, self._flush_dirty_refresh)
+
+    def _flush_dirty_refresh(self) -> None:
+        self._refresh_scheduled = False
+        dirty = set(self._refresh_dirty_sections)
+        self._refresh_dirty_sections.clear()
+
+        if "dashboard" in dirty:
+            self.refresh_dashboard()
+        if "tray" in dirty:
+            self._rebuild_tray_menu()
+        if "components" in dirty:
+            self.refresh_components()
+        if "mods" in dirty:
+            self.refresh_mods()
+        if "files" in dirty:
+            self._request_page_refresh("files")
+        if "logs" in dirty:
+            self._request_page_refresh("logs")
+
+        if self._initial_refresh_pending:
+            self._initial_refresh_pending = False
+            self._hide_loading_overlay()
+
     def refresh_all(self) -> None:
-        self.refresh_dashboard()
-        self.refresh_components()
-        self.refresh_mods()
-        self.refresh_files()
-        self.refresh_logs()
+        self.schedule_refresh_all()
+
+    def _request_page_refresh(self, section: str) -> None:
+        cached = self._page_payload_cache.get(section)
+        if cached is not None:
+            if section == "components":
+                self.refresh_components(cached)
+            elif section == "mods":
+                self.refresh_mods(cached)
+            elif section == "files":
+                self.refresh_files(cached)
+            elif section == "logs":
+                self.refresh_logs(cached)
+        if section in self._page_refresh_in_progress:
+            return
+        self._page_refresh_in_progress.add(section)
+        thread = threading.Thread(target=self._collect_page_payload_worker, args=(section,), daemon=True)
+        thread.start()
+
+    def _collect_page_payload_worker(self, section: str) -> None:
+        try:
+            payload: object
+            if section == "components":
+                payload = {
+                    "components": self.context.processes.list_components(),
+                    "states": {item.component_id: item for item in self.context.processes.list_states()},
+                }
+            elif section == "mods":
+                payload = {
+                    "index": self.context.mods.fetch_index(),
+                    "installed": {item.id: item for item in self.context.mods.list_installed()},
+                }
+            elif section == "files":
+                payload = {
+                    "records": self.context.files.list_files(),
+                    "collection_values": self.context.files.read_collection(self._current_file_collection),
+                    "collection_id": self._current_file_collection,
+                }
+            elif section == "logs":
+                entries = self.context.logging.read_entries()
+                payload = [f"[{e.timestamp}] {e.level}: {e.message} {e.context}" for e in entries[-250:]]
+            else:
+                payload = None
+            self._ui_signals.page_payload_ready.emit(section, payload)
+        except Exception:
+            self._ui_signals.page_payload_ready.emit(section, None)
+
+    def _on_page_payload_ready(self, section: str, payload: object) -> None:
+        self._page_refresh_in_progress.discard(section)
+        if payload is not None:
+            self._page_payload_cache[section] = payload
+            if section == "components":
+                self._update_runtime_snapshot_from_payload(payload)
+        visible_page = self.pages.currentIndex() if hasattr(self, "pages") else 0
+        if section == "components" and visible_page == 1:
+            self.refresh_components(payload)
+        elif section == "mods" and visible_page == 2:
+            self.refresh_mods(payload)
+        elif section == "files" and visible_page == 3:
+            self.refresh_files(payload)
+        elif section == "logs" and visible_page == 4:
+            self.refresh_logs(payload)
+        if self._loading_overlay_context == f"page:{section}":
+            self._hide_loading_overlay()
 
     def refresh_dashboard(self) -> None:
         settings = self.context.settings.get()
         self._refresh_general_combo(settings.selected_zapret_general)
-        states = {state.component_id: state for state in self.context.processes.list_states()}
-        components = {component.id: component for component in self.context.processes.list_components()}
+        states = self._component_states()
+        components = self._component_defs()
         active_ids = self._master_active_components()
         zapret_state = states.get("zapret", None)
         tg_state = states.get("tg-ws-proxy", None)
@@ -1603,13 +2555,13 @@ class MainWindow(QMainWindow):
         self.power_button.setProperty("state", "on" if fully_running else "off")
         self.power_button.style().unpolish(self.power_button)
         self.power_button.style().polish(self.power_button)
+        self._update_power_icon()
         if not active_ids:
             self.power_caption.setText(self._t("НЕТ КОМПОНЕНТОВ", "NO COMPONENTS"))
         else:
             self.power_caption.setText(self._t("ВКЛ", "ON") if fully_running else (self._t("ЧАСТИЧНО", "PARTIAL") if any_running else self._t("ВЫКЛ", "OFF")))
 
-        installed_mods = self.context.mods.list_installed()
-        enabled_mods = [mod.id for mod in installed_mods if mod.enabled]
+        enabled_mods = list(settings.enabled_mod_ids or [])
         merge_state = self.context.merge.get_state()
 
         self._set_badge("app", self._t("Работает", "Running") if fully_running else (self._t("Частично", "Partial") if any_running else self._t("Ожидание", "Idle")), "status_ok.svg" if fully_running else ("status_warn.svg" if any_running else "status_off.svg"))
@@ -1618,10 +2570,26 @@ class MainWindow(QMainWindow):
         self._set_badge("zapret", zapret_text, zapret_icon)
         self._set_badge("tg", tg_text, tg_icon)
         self._set_badge("mods", f"{len(enabled_mods)} {self._t('Активно', 'Active')}", "status_mod.svg")
-        self._set_badge("theme", settings.theme.title(), "status_theme.svg")
+        self._set_badge("theme", settings.theme.title(), self._theme_status_icon_name())
 
         if merge_state is None and enabled_mods:
-            self.context.merge.rebuild()
+            QTimer.singleShot(0, self._ensure_merge_runtime_ready)
+
+    def _ensure_merge_runtime_ready(self) -> None:
+        if self._merge_ensure_in_progress:
+            return
+        self._merge_ensure_in_progress = True
+
+        def _worker() -> None:
+            try:
+                self.context.merge.rebuild()
+            except Exception:
+                return
+            finally:
+                self._merge_ensure_in_progress = False
+            self._ui_signals.component_action_done.emit("__merge__")
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _component_badge_state(self, component: object, state: object, any_running: bool) -> tuple[str, str]:
         status = str(getattr(state, "status", "unknown") or "unknown").lower()
@@ -1636,7 +2604,7 @@ class MainWindow(QMainWindow):
         return self._t("Неизвестно", "Unknown"), "status_off.svg"
 
     def _refresh_general_combo(self, selected_id: str) -> None:
-        options = self.context.processes.list_zapret_generals()
+        options = self._sorted_general_options()
         self._updating_general_combo = True
         try:
             self.general_combo.clear()
@@ -1648,8 +2616,6 @@ class MainWindow(QMainWindow):
             target_id = selected_id
             if not target_id:
                 target_id = self.general_combo.itemData(0)
-                if target_id:
-                    self.context.settings.update(selected_zapret_general=target_id)
             for i in range(self.general_combo.count()):
                 if self.general_combo.itemData(i) == target_id:
                     self.general_combo.setCurrentIndex(i)
@@ -1666,8 +2632,8 @@ class MainWindow(QMainWindow):
         current = self.context.settings.get().selected_zapret_general
         if selected == current:
             return
-        self.context.settings.update(selected_zapret_general=selected)
-        states = {s.component_id: s for s in self.context.processes.list_states()}
+        self.context.settings.get().selected_zapret_general = selected
+        states = self._component_states()
         zapret_running = states.get("zapret") and states["zapret"].status == "running"
         if zapret_running:
             self._loading_action = "connect"
@@ -1676,10 +2642,10 @@ class MainWindow(QMainWindow):
             self._loading_frame = 0
             self._loading_timer.start()
             self._advance_loading_caption()
-            thread = threading.Thread(target=self._restart_zapret_worker, daemon=True)
-            thread.start()
+            self._submit_backend_task("select_general", {"selected": selected}, action_id="__general__")
         else:
-            self.refresh_all()
+            self._submit_backend_task("select_general", {"selected": selected}, action_id="__general__")
+            self._mark_dirty("dashboard", "components", "tray")
 
     def _on_general_selected_from_components(self, selected: str, combo: QComboBox, status_label: QLabel) -> None:
         if not selected:
@@ -1697,75 +2663,129 @@ class MainWindow(QMainWindow):
         if not self._component_loading_timer.isActive():
             self._component_loading_timer.start()
         self._advance_component_loading()
-        thread = threading.Thread(target=self._apply_general_selection_worker, args=(selected,), daemon=True)
-        thread.start()
+        self._submit_backend_task("select_general", {"selected": selected}, action_id="__general__")
 
     def _apply_general_selection_worker(self, selected: str) -> None:
-        self.context.settings.update(selected_zapret_general=selected)
-        states = {s.component_id: s for s in self.context.processes.list_states()}
+        self.context.settings.get().selected_zapret_general = selected
+        self.context.settings.save()
+        states = self._component_states()
         zapret_running = states.get("zapret") and states["zapret"].status == "running"
         if zapret_running:
             self.context.processes.stop_component("zapret")
             self.context.processes.start_component("zapret")
         self._ui_signals.component_action_done.emit("__general__")
 
+    def _sync_general_favorite_button(self, general_id: str, button: QToolButton) -> None:
+        favorite = self._is_general_favorite(general_id)
+        button.setIcon(self._icon("star_filled.svg" if favorite else "star_outline.svg"))
+        button.setIconSize(QSize(16, 16))
+        button.setToolTip(
+            self._t("Убрать из избранного", "Remove from favorites")
+            if favorite
+            else self._t("Добавить в избранное", "Add to favorites")
+        )
+
+    def _toggle_general_favorite_from_button(self, general_id: str, button: QToolButton) -> None:
+        if not general_id:
+            return
+        favorite = not self._is_general_favorite(general_id)
+        self._sync_general_favorite_button(general_id, button)
+        current = self.context.settings.get()
+        favorites = [item for item in self._favorite_general_ids() if item]
+        if favorite and general_id not in favorites:
+            favorites.append(general_id)
+        if not favorite:
+            favorites = [item for item in favorites if item != general_id]
+        current.favorite_zapret_generals = favorites
+        self._refresh_general_combo(current.selected_zapret_general)
+        self._mark_dirty("components", "tray")
+        self._submit_backend_task("set_favorite_generals", {"favorites": favorites}, action_id="__favorite__")
+
     def _master_active_components(self) -> list[str]:
-        return [c.id for c in self.context.processes.list_components() if c.id in ("zapret", "tg-ws-proxy") and c.enabled]
+        return [c.id for c in self._component_defs().values() if c.id in ("zapret", "tg-ws-proxy") and c.enabled]
 
     def _maybe_run_first_general_autotest(self) -> None:
         settings = self.context.settings.get()
-        options = self.context.processes.list_zapret_generals()
+        if settings.general_autotest_done:
+            return
+        options = self._sorted_general_options()
         if not options:
             return
-        if settings.selected_zapret_general and any(item["id"] == settings.selected_zapret_general for item in options):
-            if not settings.general_autotest_done:
-                self.context.settings.update(general_autotest_done=True)
+        if self._first_general_prompt is not None:
+            try:
+                self._first_general_prompt.raise_()
+                self._first_general_prompt.activateWindow()
+            except Exception:
+                pass
             return
-        answer = self._ask_yes_no(
-            self._t("Первичная настройка", "First setup"),
-            self._t("Конфигурация пока не выбрана.\n\nЗапустить автоподбор сейчас?", "No configuration is selected yet.\n\nRun auto-check now to find a working one?"),
-        )
-        if not answer:
-            self.context.settings.update(general_autotest_done=True)
-            self.refresh_all()
-            return
-        self._loading_action = "connect"
-        self._toggle_in_progress = True
-        self.power_button.setEnabled(False)
-        self._loading_frame = 0
-        self._loading_timer.start()
-        self._advance_loading_caption()
-        thread = threading.Thread(target=self._run_general_autotest_worker, daemon=True)
-        thread.start()
 
-    def _run_general_autotest_worker(self) -> None:
-        result = self.context.processes.auto_select_working_general()
-        self.context.settings.update(general_autotest_done=True)
-        if result and result.get("id"):
-            self.context.logging.log("info", "Auto-test selected general", general=result.get("id"))
-            full = str(result.get("status")) == "ok"
-            self._pending_info_message = (
-                self._t("Настройка завершена", "Setup complete") if full else self._t("Лучший результат", "Best result"),
-                self._t("Рабочая конфигурация найдена.\nОна выбрана автоматически.", "A working configuration was found.\nIt is now selected automatically.")
-                if full
-                else self._t(
-                    f"Полностью рабочая конфигурация не найдена.\nВыбран лучший результат: {int(result.get('passed_targets', 0))}/{int(result.get('total_targets', 0))} тестов.",
-                    f"No fully working configuration was found.\nBest result selected: {int(result.get('passed_targets', 0))}/{int(result.get('total_targets', 0))} tests.",
-                ),
+        dialog = AppDialog(self, self.context, self._t("Первичная настройка", "First setup"))
+        dialog.setModal(False)
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        label = QLabel(
+            self._t(
+                "Конфигурация пока не выбрана.\n\nЗапустить автоподбор сейчас?",
+                "No configuration is selected yet.\n\nRun auto-check now to find a working one?",
             )
-        else:
-            self._pending_info_message = (
-                self._t("Результат настройки", "Setup result"),
-                self._t("Автоматически рабочая конфигурация не найдена.\nВыберите её вручную из списка.", "No working configuration was found automatically.\nPlease pick one manually from the list."),
-            )
-        self._ui_signals.toggle_done.emit()
+        )
+        label.setWordWrap(True)
+        dialog.body_layout.addWidget(label)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        no_btn = QPushButton(self._t("Нет", "No"))
+        yes_btn = QPushButton(self._t("Да", "Yes"))
+        yes_btn.setProperty("class", "primary")
+        row.addWidget(no_btn)
+        row.addWidget(yes_btn)
+        dialog.body_layout.addLayout(row)
+
+        def _cleanup_prompt() -> None:
+            if self._first_general_prompt is dialog:
+                self._first_general_prompt = None
+            dialog.deleteLater()
+
+        def _decline() -> None:
+            settings.general_autotest_done = True
+            self._submit_backend_task("set_general_autotest_done", {"done": True}, action_id="__autotest_declined__")
+            dialog.close()
+
+        def _accept() -> None:
+            dialog.close()
+            QTimer.singleShot(0, lambda: self._run_general_tests_popup(auto_apply=True))
+
+        no_btn.clicked.connect(_decline)
+        yes_btn.clicked.connect(_accept)
+        dialog.finished.connect(lambda _result: _cleanup_prompt())
+        dialog.prepare_and_center()
+        self._first_general_prompt = dialog
+        dialog.show()
 
     def _restart_zapret_worker(self) -> None:
+        self.context.settings.save()
         self.context.processes.stop_component("zapret")
         self.context.processes.start_component("zapret")
         self._ui_signals.toggle_done.emit()
 
     def _on_component_action_done(self, action_id: str) -> None:
+        if action_id == "__settings__":
+            self._hide_loading_overlay()
+            self._mark_dirty("dashboard", "components", "tray")
+            return
+
+        if action_id == "__favorite__":
+            return
+
+        if action_id == "__autotest_declined__":
+            return
+
+        if action_id == "__merge__":
+            self._mark_dirty("dashboard")
+            return
+
+        if action_id == "__merge_rebuild__":
+            self._mark_dirty("dashboard", "mods", "files", "logs", "tray")
+            return
+
         if action_id == "__general__":
             if self._general_loading_combo is not None:
                 try:
@@ -1782,16 +2802,16 @@ class MainWindow(QMainWindow):
             self._general_loading_label = None
             if not self._component_loading_buttons:
                 self._component_loading_timer.stop()
-            self.refresh_all()
+            self._mark_dirty("dashboard", "components", "tray")
             return
 
         self._stop_component_loading(action_id)
-        self.refresh_all()
+        self._mark_dirty("dashboard", "components", "tray")
 
-    def _run_general_tests_popup(self) -> None:
+    def _run_general_tests_popup(self, auto_apply: bool = False) -> None:
         if self._general_test_running:
             return
-        options = self.context.processes.list_zapret_generals()
+        options = self._sorted_general_options()
         if not options:
             self._show_info(self._t("Проверка конфигураций", "Run general tests"), self._t("Список конфигураций пока пуст.", "The configuration list is empty."))
             return
@@ -1799,6 +2819,11 @@ class MainWindow(QMainWindow):
         self._general_test_running = True
         self._general_test_cancelled = False
         self._general_test_show_results = True
+        self._general_test_auto_apply = auto_apply
+        self._general_test_started_at = time.time()
+        self._general_test_current_index = 0
+        self._general_test_total = 0
+        self._general_test_last_progress_at = self._general_test_started_at
         dialog = AppDialog(self, self.context, self._t("Проверка конфигураций", "Run general tests"))
         title = QLabel(
             self._t(
@@ -1811,18 +2836,23 @@ class MainWindow(QMainWindow):
         status = QLabel(self._t("Подготовка...", "Preparing..."))
         status.setProperty("class", "muted")
         dialog.body_layout.addWidget(status)
+        eta = QLabel(self._t("Расчёт времени...", "Estimating time..."))
+        eta.setProperty("class", "muted")
+        dialog.body_layout.addWidget(eta)
         bar = QProgressBar()
-        bar.setRange(0, len(options))
+        bar.setRange(0, 100)
         bar.setValue(0)
         dialog.body_layout.addWidget(bar)
         dialog.prepare_and_center()
         dialog.show()
         self._general_test_dialog = dialog
         self._general_test_status_label = status
+        self._general_test_eta_label = eta
         self._general_test_progress_bar = bar
         dialog.rejected.connect(self._cancel_general_tests)
-        thread = threading.Thread(target=self._run_general_tests_worker, daemon=True)
-        thread.start()
+        self._update_general_test_eta()
+        self._general_test_eta_timer.start()
+        self._general_test_task_id = self._submit_backend_task("run_general_diagnostics", action_id="__general_test__")
 
     def _run_general_tests_worker(self) -> None:
         results = self.context.processes.run_general_diagnostics(
@@ -1834,29 +2864,57 @@ class MainWindow(QMainWindow):
     def _cancel_general_tests(self) -> None:
         self._general_test_cancelled = True
         self._general_test_show_results = False
-        try:
-            self.context.processes.stop_all()
-        except Exception:
-            pass
+        self._general_test_eta_timer.stop()
+        if self.context.backend is not None and self._general_test_task_id:
+            self.context.backend.cancel(self._general_test_task_id)
 
     def _on_general_test_progress(self, current: int, total: int, name: str) -> None:
+        self._general_test_current_index = current
+        self._general_test_total = total
+        self._general_test_last_progress_at = time.time()
         if self._general_test_progress_bar is not None:
             self._general_test_progress_bar.setMaximum(total)
-            self._general_test_progress_bar.setValue(current)
+            self._general_test_progress_bar.setValue(max(0, min(current, total)))
         if self._general_test_status_label is not None:
             self._general_test_status_label.setText(
                 self._t(
-                    f"Проверяется: {name} ({current}/{total})",
-                    f"Checking: {name} ({current}/{total})",
+                    f"Проверяется: {name}",
+                    f"Checking: {name}",
                 )
             )
+        self._update_general_test_eta()
+
+    def _update_general_test_eta(self) -> None:
+        if self._general_test_eta_label is None or self._general_test_total <= 0:
+            return
+        if self._general_test_current_index <= 2 or self._general_test_started_at <= 0:
+            self._general_test_eta_label.setText(self._t("Расчёт времени...", "Estimating time..."))
+            return
+        now = time.time()
+        elapsed = max(0.0, now - self._general_test_started_at)
+        completed = max(1, self._general_test_current_index)
+        avg_per_step = max(0.1, elapsed / completed)
+        in_step_elapsed = max(0.0, now - self._general_test_last_progress_at)
+        in_step_fraction = min(0.95, in_step_elapsed / avg_per_step)
+        effective_completed = min(float(self._general_test_total), completed + in_step_fraction)
+        remaining_after_current = max(0.0, float(self._general_test_total) - effective_completed)
+        estimate_seconds = max(0, round(avg_per_step * remaining_after_current))
+        self._general_test_eta_label.setText(
+            self._t(
+                f"Осталось примерно: {estimate_seconds} сек.",
+                f"About {estimate_seconds}s remaining.",
+            )
+        )
 
     def _on_general_test_done(self, results: object) -> None:
         self._general_test_running = False
+        self._general_test_task_id = None
+        self._general_test_eta_timer.stop()
         if self._general_test_dialog is not None:
             self._general_test_dialog.accept()
         self._general_test_dialog = None
         self._general_test_status_label = None
+        self._general_test_eta_label = None
         self._general_test_progress_bar = None
 
         checked = results if isinstance(results, list) else []
@@ -1865,11 +2923,14 @@ class MainWindow(QMainWindow):
         best_label = ""
         best_score = -1
         best_total = 0
+        best_id = ""
+        best_working_id = ""
         for raw in checked:
             if not isinstance(raw, dict):
                 continue
             label = self._format_general_option_label(
                 {
+                    "id": str(raw.get("id", "")),
                     "bundle": str(raw.get("bundle", "")),
                     "name": str(raw.get("name", "")),
                 }
@@ -1880,14 +2941,29 @@ class MainWindow(QMainWindow):
                 best_score = passed
                 best_total = total
                 best_label = label
+                best_id = str(raw.get("id", ""))
             if raw.get("status") == "ok":
                 working.append(label)
+                if not best_working_id:
+                    best_working_id = str(raw.get("id", ""))
             else:
                 error_text = str(raw.get("error", "")).strip() or self._t("не удалось запустить", "failed to start")
                 failed.append(f"{label} - {error_text}")
 
-        if not self._general_test_show_results:
+        chosen_id = best_working_id or best_id
+        auto_applied = False
+        if self._general_test_auto_apply and chosen_id:
+            self.context.settings.update(
+                selected_zapret_general=chosen_id,
+                general_autotest_done=True,
+            )
+            self._set_general_favorite(chosen_id, True)
             self.refresh_all()
+            auto_applied = True
+        self._general_test_auto_apply = False
+
+        if not self._general_test_show_results:
+            self._mark_dirty("dashboard", "components", "tray")
             return
 
         dialog = AppDialog(self, self.context, self._t("Результаты проверки", "Test results"))
@@ -1904,6 +2980,12 @@ class MainWindow(QMainWindow):
             + (
                 f"{self._t('Лучший результат:', 'Best result:')}\n{best_label} ({best_score}/{best_total})\n\n"
                 if not working and best_label
+                else ""
+            )
+            + (
+                f"{self._t('Применено автоматически:', 'Applied automatically:')}\n"
+                f"{self._format_general_option_label(next((item for item in self._sorted_general_options() if item['id'] == chosen_id), {'id': chosen_id, 'bundle': '', 'name': chosen_id}))}\n\n"
+                if auto_applied and chosen_id
                 else ""
             )
             + f"{self._t('Не работают или дают ошибку:', 'Not working or failed:')}\n"
@@ -1989,9 +3071,44 @@ class MainWindow(QMainWindow):
         dialog.prepare_and_center()
         return dialog.exec() == QDialog.DialogCode.Accepted
 
-    def refresh_components(self) -> None:
-        components = self.context.processes.list_components()
-        states = {item.component_id: item for item in self.context.processes.list_states()}
+    def refresh_components(self, payload: object | None = None) -> None:
+        components: list[ComponentDefinition] = []
+        states: dict[str, ComponentState] = {}
+        if isinstance(payload, dict):
+            raw_components = payload.get("components", [])
+            raw_states = payload.get("states", {})
+            if isinstance(raw_components, list):
+                for item in raw_components:
+                    if isinstance(item, ComponentDefinition):
+                        components.append(item)
+                    elif isinstance(item, dict):
+                        try:
+                            components.append(ComponentDefinition(**item))
+                        except Exception:
+                            continue
+            if isinstance(raw_states, dict):
+                for key, item in raw_states.items():
+                    if isinstance(item, ComponentState):
+                        states[str(key)] = item
+                    elif isinstance(item, dict):
+                        try:
+                            states[str(key)] = ComponentState(**item)
+                        except Exception:
+                            continue
+            elif isinstance(raw_states, list):
+                for item in raw_states:
+                    if isinstance(item, ComponentState):
+                        states[item.component_id] = item
+                    elif isinstance(item, dict) and item.get("component_id"):
+                        try:
+                            parsed = ComponentState(**item)
+                            states[parsed.component_id] = parsed
+                        except Exception:
+                            continue
+        if not components:
+            components = list(self._component_defs().values())
+        if not states:
+            states = self._component_states()
         self.components_list.clear()
         for component in components:
             state = states.get(component.id)
@@ -2011,6 +3128,24 @@ class MainWindow(QMainWindow):
             widget = layout_item.widget()
             if widget is not None:
                 widget.deleteLater()
+
+        if not components:
+            empty, empty_layout = self._card()
+            empty_title = QLabel(self._t("Компоненты пока недоступны", "Components are currently unavailable"))
+            empty_title.setProperty("class", "title")
+            empty_text = QLabel(
+                self._t(
+                    "Данные ещё подгружаются. Попробуйте открыть вкладку ещё раз через секунду.",
+                    "Data is still loading. Try opening this tab again in a second.",
+                )
+            )
+            empty_text.setProperty("class", "muted")
+            empty_text.setWordWrap(True)
+            empty_layout.addWidget(empty_title)
+            empty_layout.addWidget(empty_text)
+            self._components_cards_layout.addWidget(empty)
+            self._components_cards_layout.addStretch(1)
+            return
 
         descriptions = {
             "zapret": self._t(
@@ -2072,7 +3207,7 @@ class MainWindow(QMainWindow):
                 config_status = QLabel("")
                 config_status.setProperty("class", "muted")
                 config_status.hide()
-                options = self.context.processes.list_zapret_generals()
+                options = self._sorted_general_options()
                 selected = self.context.settings.get().selected_zapret_general
                 for option in options:
                     config_combo.addItem(self._format_general_option_label(option), option["id"])
@@ -2083,6 +3218,9 @@ class MainWindow(QMainWindow):
                             picked_index = i
                             break
                     config_combo.setCurrentIndex(picked_index)
+                config_row = QHBoxLayout()
+                config_row.setContentsMargins(0, 0, 0, 0)
+                config_row.setSpacing(8)
                 config_combo.currentIndexChanged.connect(
                     lambda _=0, combo=config_combo, status_label=config_status: self._on_general_selected_from_components(
                         str(combo.currentData() or ""),
@@ -2090,7 +3228,25 @@ class MainWindow(QMainWindow):
                         status_label,
                     )
                 )
-                card_layout.addWidget(config_combo)
+                favorite_btn = QToolButton()
+                favorite_btn.setProperty("class", "action")
+                current_general = str(config_combo.currentData() or "")
+                self._sync_general_favorite_button(current_general, favorite_btn)
+                favorite_btn.clicked.connect(
+                    lambda _=False, combo=config_combo, btn=favorite_btn: self._toggle_general_favorite_from_button(
+                        str(combo.currentData() or ""),
+                        btn,
+                    )
+                )
+                config_combo.currentIndexChanged.connect(
+                    lambda _=0, combo=config_combo, btn=favorite_btn: self._sync_general_favorite_button(
+                        str(combo.currentData() or ""),
+                        btn,
+                    )
+                )
+                config_row.addWidget(config_combo, 1)
+                config_row.addWidget(favorite_btn, 0)
+                card_layout.addLayout(config_row)
                 card_layout.addWidget(config_status)
 
             if component.id == "tg-ws-proxy":
@@ -2169,32 +3325,51 @@ class MainWindow(QMainWindow):
                     break
 
     def _toggle_mod_by_id(self, mod_id: str) -> None:
-        installed = {item.id: item for item in self.context.mods.list_installed()}
-        if mod_id not in installed:
-            self.context.mods.install(mod_id)
-            installed = {item.id: item for item in self.context.mods.list_installed()}
-        if mod_id in installed:
-            self.context.mods.set_enabled(mod_id, not installed[mod_id].enabled)
-        self.refresh_all()
+        self._submit_backend_task("toggle_mod", {"mod_id": mod_id}, action_id=f"mod:{mod_id}")
 
-    def refresh_mods(self) -> None:
-        index = self.context.mods.fetch_index()
-        installed = {item.id: item for item in self.context.mods.list_installed()}
+    def refresh_mods(self, payload: object | None = None) -> None:
+        def _field(obj: object, name: str, default: object = "") -> object:
+            if isinstance(obj, dict):
+                return obj.get(name, default)
+            return getattr(obj, name, default)
+
+        index: list[object] = []
+        installed: dict[str, object] = {}
+        if isinstance(payload, dict):
+            raw_index = payload.get("index", [])
+            raw_installed = payload.get("installed", {})
+            if isinstance(raw_index, list):
+                index = list(raw_index)
+            if isinstance(raw_installed, dict):
+                installed = {str(key): value for key, value in raw_installed.items()}
+            elif isinstance(raw_installed, list):
+                for item in raw_installed:
+                    item_id = str(_field(item, "id", "") or "")
+                    if item_id:
+                        installed[item_id] = item
+        if not index:
+            index = self.context.mods.fetch_index()
+        if not installed:
+            installed = {item.id: item for item in self.context.mods.list_installed()}
         combined: list[dict[str, str | bool]] = []
         seen: set[str] = set()
         for item in index:
-            seen.add(item.id)
-            enabled = item.id in installed and installed[item.id].enabled
-            state = "enabled" if enabled else ("installed" if item.id in installed else "not installed")
+            item_id = str(_field(item, "id", "") or "")
+            if not item_id:
+                continue
+            seen.add(item_id)
+            installed_item = installed.get(item_id)
+            enabled = bool(_field(installed_item, "enabled", False)) if installed_item is not None else False
+            state = "enabled" if enabled else ("installed" if item_id in installed else "not installed")
             combined.append(
                 {
-                    "id": item.id,
-                    "name": item.name,
-                    "description": item.description or self._t("Описание не указано.", "No description."),
-                    "subtitle": f"{self._t('Автор', 'Author')}: {item.author} | {self._t('Версия', 'Version')}: {item.version}",
+                    "id": item_id,
+                    "name": str(_field(item, "name", item_id)),
+                    "description": str(_field(item, "description", "") or self._t("Описание не указано.", "No description.")),
+                    "subtitle": f"{self._t('Автор', 'Author')}: {str(_field(item, 'author', 'goshkow'))} | {self._t('Версия', 'Version')}: {str(_field(item, 'version', ''))}",
                     "state": state,
                     "enabled": enabled,
-                    "changelog": item.changelog or "",
+                    "changelog": str(_field(item, "changelog", "") or ""),
                 }
             )
 
@@ -2204,11 +3379,11 @@ class MainWindow(QMainWindow):
             combined.append(
                 {
                     "id": mod_id,
-                    "name": item.name or mod_id,
-                    "description": item.description or self._t("Локальная модификация без описания.", "Local mod without description."),
-                    "subtitle": f"{self._t('Автор', 'Author')}: {item.author or 'goshkow'} | {self._t('Версия', 'Version')}: {item.version}",
-                    "state": "enabled" if item.enabled else "installed",
-                    "enabled": item.enabled,
+                    "name": str(_field(item, "name", mod_id) or mod_id),
+                    "description": str(_field(item, "description", "") or self._t("Локальная модификация без описания.", "Local mod without description.")),
+                    "subtitle": f"{self._t('Автор', 'Author')}: {str(_field(item, 'author', 'goshkow') or 'goshkow')} | {self._t('Версия', 'Version')}: {str(_field(item, 'version', ''))}",
+                    "state": "enabled" if bool(_field(item, "enabled", False)) else "installed",
+                    "enabled": bool(_field(item, "enabled", False)),
                     "changelog": "",
                 }
             )
@@ -2366,8 +3541,16 @@ class MainWindow(QMainWindow):
 
         self.mods_cards_layout.addStretch(1)
 
-    def refresh_files(self) -> None:
-        records = self.context.files.list_files()
+    def refresh_files(self, payload: object | None = None) -> None:
+        if isinstance(payload, dict):
+            if payload.get("collection_id") == self._current_file_collection:
+                self._refresh_file_collection_view_with_values(list(payload.get("collection_values", [])))
+            else:
+                self._refresh_file_collection_view()
+            records = payload.get("records", [])
+        else:
+            self._refresh_file_collection_view()
+            records = self.context.files.list_files()
         selected = self._selected_file_path()
         self.files_list.clear()
         for record in records:
@@ -2382,9 +3565,12 @@ class MainWindow(QMainWindow):
                     self.files_list.setCurrentItem(it)
                     break
 
-    def refresh_logs(self) -> None:
-        entries = self.context.logging.read_entries()
-        lines = [f"[{e.timestamp}] {e.level}: {e.message} {e.context}" for e in entries[-250:]]
+    def refresh_logs(self, payload: object | None = None) -> None:
+        if isinstance(payload, list):
+            lines = payload
+        else:
+            entries = self.context.logging.read_entries()
+            lines = [f"[{e.timestamp}] {e.level}: {e.message} {e.context}" for e in entries[-250:]]
         self.logs_text.setPlainText("\n".join(lines))
 
 

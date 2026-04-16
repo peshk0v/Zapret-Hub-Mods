@@ -67,6 +67,14 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
     #DialogBody {
         background: transparent;
     }
+    #LoadingOverlay {
+        background: rgba(9, 13, 22, 0.42);
+    }
+    #LoadingCard {
+        background: #141f32;
+        border: 1px solid #2d456d;
+        border-radius: 16px;
+    }
     QFrame[class="card"] {
         background: qlineargradient(x1:0, y1:1, x2:1, y2:0, stop:0 #131d30, stop:0.68 #162238, stop:1 #1a2842);
         border: 1px solid #243550;
@@ -217,6 +225,15 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
         image: none;
         width: 0px;
         height: 0px;
+    }
+    QFrame[class="fileModeCard"] {
+        background: qlineargradient(x1:0, y1:1, x2:1, y2:0, stop:0 #141e31, stop:1 #1a2942);
+        border: 1px solid #2e466d;
+        border-radius: 14px;
+    }
+    QFrame[class="fileModeCard"][hovered="true"] {
+        background: qlineargradient(x1:0, y1:1, x2:1, y2:0, stop:0 #1a2842, stop:1 #203252);
+        border: 1px solid #4f73b3;
     }
     QPushButton[class="primary"] {
         background: #5865f2;
@@ -506,6 +523,14 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
     #DialogBody {
         background: transparent;
     }
+    #LoadingOverlay {
+        background: rgba(228, 236, 248, 0.58);
+    }
+    #LoadingCard {
+        background: #ffffff;
+        border: 1px solid #d2ddeb;
+        border-radius: 16px;
+    }
     QFrame[class="card"] {
         background: qlineargradient(x1:0, y1:1, x2:1, y2:0, stop:0 #f3f7ff, stop:0.68 #fbfdff, stop:1 #ffffff);
         border: 1px solid #d2ddeb;
@@ -656,6 +681,15 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
         image: none;
         width: 0px;
         height: 0px;
+    }
+    QFrame[class="fileModeCard"] {
+        background: qlineargradient(x1:0, y1:1, x2:1, y2:0, stop:0 #f3f7ff, stop:1 #ffffff);
+        border: 1px solid #cad8ee;
+        border-radius: 14px;
+    }
+    QFrame[class="fileModeCard"][hovered="true"] {
+        background: qlineargradient(x1:0, y1:1, x2:1, y2:0, stop:0 #e8f0ff, stop:1 #ffffff);
+        border: 1px solid #8ea9df;
     }
     QPushButton[class="primary"] {
         background: #5865f2;
