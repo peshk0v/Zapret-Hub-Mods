@@ -341,7 +341,7 @@ def _write_uninstall_registry(install_dir: Path, uninstaller_exe: Path, app_exe:
     uninstall_cmd = f'"{uninstaller_exe}" --uninstall --install-dir "{install_dir}"'
     values = {
         "DisplayName": "Zapret Hub",
-        "DisplayVersion": "1.2.0",
+        "DisplayVersion": "1.3.0",
         "Publisher": "goshkow",
         "InstallLocation": str(install_dir),
         "DisplayIcon": str(app_exe),
