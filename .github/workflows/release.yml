@@ -159,6 +159,10 @@ jobs:
         shell: pwsh
         run: Copy-Item .\dist_installer\install_zaprethub_1.4.2_universal.exe .\release_1.4.2\ -Force
 
+      - name: Prepare release notes body
+        shell: pwsh
+        run: Copy-Item .\.github\release-notes\1.4.2.md .\.release_body.md -Force
+
       - name: SignPath placeholder
         shell: pwsh
         run: .\scripts\signpath_stub.ps1 -InputPath ".\.artifacts\win_x64\zapret_hub.exe"
@@ -168,7 +172,7 @@ jobs:
         with:
           tag_name: ${{ inputs.tag }}
           name: ${{ inputs.release_name }}
-          body: ${{ inputs.changelog }}
+          body_path: .\.release_body.md
           files: |
             release_1.4.2/install_zaprethub_1.4.2_universal.exe
             release_1.4.2/*portable*.zip

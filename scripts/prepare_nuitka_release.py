@@ -23,7 +23,7 @@ def _should_skip_path(path: Path, source_dir: Path) -> bool:
     return False
 
 
-def _zip_with_root(source_dir: Path, zip_path: Path, root_name: str = "zapret_hub") -> None:
+def _zip_with_root(source_dir: Path, zip_path: Path, root_name: str | None = "zapret_hub") -> None:
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     if zip_path.exists():
         zip_path.unlink()
@@ -37,7 +37,8 @@ def _zip_with_root(source_dir: Path, zip_path: Path, root_name: str = "zapret_hu
                 continue
             rel = item.relative_to(source_dir)
             try:
-                archive.write(item, Path(root_name) / rel)
+                archive_path = (Path(root_name) / rel) if root_name else rel
+                archive.write(item, archive_path)
             except (PermissionError, FileNotFoundError):
                 continue
 
@@ -92,8 +93,8 @@ def main() -> None:
     for backup_dir in portable_arm64_dir.rglob("tg-ws-proxy.bak.*"):
         if backup_dir.is_dir():
             shutil.rmtree(backup_dir, ignore_errors=True)
-    _zip_with_root(portable_x64_dir, release_dir / f"zapret_hub_{version}_portable_win_x64.zip")
-    _zip_with_root(portable_arm64_dir, release_dir / f"zapret_hub_{version}_portable_win_arm64.zip")
+    _zip_with_root(portable_x64_dir, release_dir / f"zapret_hub_{version}_portable_win_x64.zip", root_name=None)
+    _zip_with_root(portable_arm64_dir, release_dir / f"zapret_hub_{version}_portable_win_arm64.zip", root_name=None)
 
     note = release_dir / "README_RELEASE.txt"
     note.write_text(
