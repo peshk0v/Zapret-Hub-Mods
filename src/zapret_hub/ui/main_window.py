@@ -4001,6 +4001,13 @@ class MainWindow(QMainWindow):
             self._mark_dirty("dashboard", "files", "logs", "tray")
             self._ui_signals.component_action_done.emit("__files_collection__")
             return
+        if action == "load_files_payload":
+            files_payload = payload.get("files_payload") if isinstance(payload, dict) else None
+            if isinstance(files_payload, dict):
+                self._page_payload_cache["files"] = files_payload
+                if self.pages.currentIndex() == 3:
+                    self.refresh_files(files_payload)
+            return
         if action == "write_file_text":
             saved_path = str(payload.get("path", "") or "")
             if saved_path:
@@ -6264,6 +6271,16 @@ class MainWindow(QMainWindow):
                 cached_collection = str(cached.get("collection_id", "") or "")
                 if cached_mode == mode_index and cached_collection == collection_id:
                     self.refresh_files(cached)
+            if self.context.backend is not None:
+                try:
+                    self._submit_backend_task(
+                        "load_files_payload",
+                        {"_token": token, "mode_index": mode_index, "collection_id": collection_id},
+                        action_id="__files_payload__",
+                    )
+                    return
+                except Exception:
+                    pass
             thread = threading.Thread(
                 target=self._collect_files_payload_worker,
                 args=(token, mode_index, collection_id),
