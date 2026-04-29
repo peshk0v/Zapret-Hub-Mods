@@ -45,7 +45,7 @@ jobs:
 
       - name: Build Nuitka x64
         shell: pwsh
-        run: .\scripts\build_nuitka.ps1 -Python python -OutputDir dist_nuitka
+        run: .\scripts\build_nuitka.ps1 -Python python -OutputDir dist_nuitka -Compiler zig
 
       - name: Upload x64 artifact
         uses: actions/upload-artifact@v6
@@ -86,7 +86,7 @@ jobs:
 
       - name: Build Nuitka arm64
         shell: pwsh
-        run: .\scripts\build_nuitka.ps1 -Python python -OutputDir dist_nuitka
+        run: .\scripts\build_nuitka.ps1 -Python python -OutputDir dist_nuitka -Compiler msvc
 
       - name: Upload arm64 artifact
         uses: actions/upload-artifact@v6
