@@ -6,7 +6,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 
 
 def _should_skip_path(path: Path, source_dir: Path) -> bool:
@@ -23,7 +23,7 @@ def _should_skip_path(path: Path, source_dir: Path) -> bool:
     return False
 
 
-def _zip_with_root(source_dir: Path, zip_path: Path, root_name: str | None = "zapret_hub") -> None:
+def _zip_with_root(source_dir: Path, zip_path: Path, root_name: str = "zapret_hub") -> None:
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     if zip_path.exists():
         zip_path.unlink()
@@ -37,8 +37,7 @@ def _zip_with_root(source_dir: Path, zip_path: Path, root_name: str | None = "za
                 continue
             rel = item.relative_to(source_dir)
             try:
-                archive_path = (Path(root_name) / rel) if root_name else rel
-                archive.write(item, archive_path)
+                archive.write(item, Path(root_name) / rel)
             except (PermissionError, FileNotFoundError):
                 continue
 
@@ -68,14 +67,10 @@ def main() -> None:
     if not arm64_source.exists():
         raise FileNotFoundError(f"arm64 source not found: {arm64_source}")
 
-    if payload_dir.exists():
-        shutil.rmtree(payload_dir, ignore_errors=True)
     payload_dir.mkdir(parents=True, exist_ok=True)
     _zip_with_root(x64_source, payload_dir / "win_x64.zip")
     _zip_with_root(arm64_source, payload_dir / "win_arm64.zip")
 
-    if release_dir.exists():
-        shutil.rmtree(release_dir, ignore_errors=True)
     release_dir.mkdir(parents=True, exist_ok=True)
     portable_x64_dir = release_dir / f"zapret_hub_{version}_portable_win_x64"
     portable_arm64_dir = release_dir / f"zapret_hub_{version}_portable_win_arm64"
@@ -93,8 +88,8 @@ def main() -> None:
     for backup_dir in portable_arm64_dir.rglob("tg-ws-proxy.bak.*"):
         if backup_dir.is_dir():
             shutil.rmtree(backup_dir, ignore_errors=True)
-    _zip_with_root(portable_x64_dir, release_dir / f"zapret_hub_{version}_portable_win_x64.zip", root_name=None)
-    _zip_with_root(portable_arm64_dir, release_dir / f"zapret_hub_{version}_portable_win_arm64.zip", root_name=None)
+    _zip_with_root(portable_x64_dir, release_dir / f"zapret_hub_{version}_portable_win_x64.zip")
+    _zip_with_root(portable_arm64_dir, release_dir / f"zapret_hub_{version}_portable_win_arm64.zip")
 
     note = release_dir / "README_RELEASE.txt"
     note.write_text(

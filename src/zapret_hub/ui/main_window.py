@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from zapret_hub import __version__
-from zapret_hub.domain import ComponentDefinition, ComponentState
+from zapret_hub.domain import ComponentDefinition, ComponentState, FileRecord
 from PySide6.QtCore import QCoreApplication, QEasingCurve, QEvent, QEventLoop, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal, QPropertyAnimation, QParallelAnimationGroup, Property, QByteArray
 from PySide6.QtGui import QAction, QActionGroup, QColor, QCloseEvent, QFontMetrics, QIcon, QImage, QKeyEvent, QLinearGradient, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient, QRegion, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
@@ -1532,11 +1532,12 @@ class AppDialog(QDialog):
 class SettingsDialog(AppDialog):
     def __init__(self, parent: QWidget, context: ApplicationContext) -> None:
         self.context = context
+        self._smooth_scroll_helpers: list[SmoothScrollController] = []
         super().__init__(parent, context, self._t("Настройки", "Settings"))
-        self.setMinimumWidth(430)
+        self.setMinimumWidth(520)
+        self.resize(560, 780)
         layout = self.body_layout
 
-        form = QFormLayout()
         self.theme_combo = ClickSelectComboBox()
         for theme_id in ("night", "dark", "oled", "light", "light blue"):
             self.theme_combo.addItem(theme_id, theme_id)
@@ -1545,6 +1546,18 @@ class SettingsDialog(AppDialog):
         self.tg_host_input = QLineEdit()
         self.tg_port_input = QLineEdit()
         self.tg_secret_input = QLineEdit()
+        self.tg_media_mode_combo = ClickSelectComboBox()
+        self.tg_media_mode_combo.addItem(self._t("Стандартный", "Default"), "default")
+        self.tg_media_mode_combo.addItem(self._t("Фото/видео fix", "Photo/video fix"), "media_fix")
+        self.tg_media_mode_combo.addItem(self._t("Без DC override", "No DC override"), "empty")
+        self.tg_dc_ip_input = QTextEdit()
+        self.tg_dc_ip_input.setFixedHeight(72)
+        self.tg_cfproxy_checkbox = QCheckBox(self._t("Cloudflare fallback", "Cloudflare fallback"))
+        self.tg_cfproxy_priority_checkbox = QCheckBox(self._t("Пробовать Cloudflare первым", "Try Cloudflare first"))
+        self.tg_cfproxy_domain_input = QLineEdit()
+        self.tg_fake_tls_input = QLineEdit()
+        self.tg_buf_input = QLineEdit()
+        self.tg_pool_input = QLineEdit()
         self.ipset_mode_combo = ClickSelectComboBox()
         self.ipset_mode_combo.addItem("loaded", "loaded")
         self.ipset_mode_combo.addItem("none", "none")
@@ -1559,18 +1572,49 @@ class SettingsDialog(AppDialog):
         self.tray_checkbox = QCheckBox(self._t("Стартовать в трее", "Start in tray"))
         self.auto_components_checkbox = QCheckBox(self._t("Автозапуск компонентов", "Auto-run components"))
         self.check_updates_checkbox = QCheckBox(self._t("Проверять наличие обновлений", "Check for updates"))
-        form.addRow(self._t("Тема", "Theme"), self.theme_combo)
-        form.addRow(self._t("Язык", "Language"), self.language_combo)
-        form.addRow(self._t("Хост TG proxy", "TG proxy host"), self.tg_host_input)
-        form.addRow(self._t("Порт TG proxy", "TG proxy port"), self.tg_port_input)
-        form.addRow(self._t("Секрет TG proxy", "TG proxy secret"), self.tg_secret_input)
-        form.addRow("IPSet mode", self.ipset_mode_combo)
-        form.addRow(self._t("Gaming mode", "Gaming mode"), self.game_mode_combo)
-        form.addRow("", self.autostart_checkbox)
-        form.addRow("", self.tray_checkbox)
-        form.addRow("", self.auto_components_checkbox)
-        form.addRow("", self.check_updates_checkbox)
-        layout.addLayout(form)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("SettingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMinimumHeight(390)
+        scroll.setMaximumHeight(540)
+        canvas = QWidget()
+        canvas.setObjectName("SettingsCanvas")
+        canvas_layout = QVBoxLayout(canvas)
+        canvas_layout.setContentsMargins(0, 0, 0, 0)
+        canvas_layout.setSpacing(10)
+        scroll.setWidget(canvas)
+        self._smooth_scroll_helpers.append(SmoothScrollController(scroll))
+        layout.addWidget(scroll, 1)
+
+        app_form = self._settings_section(canvas_layout, self._t("Приложение", "Application"))
+        app_form.addRow(self._t("Тема", "Theme"), self.theme_combo)
+        app_form.addRow(self._t("Язык", "Language"), self.language_combo)
+        app_form.addRow("", self.autostart_checkbox)
+        app_form.addRow("", self.tray_checkbox)
+        app_form.addRow("", self.auto_components_checkbox)
+        app_form.addRow("", self.check_updates_checkbox)
+
+        zapret_form = self._settings_section(canvas_layout, "Zapret")
+        zapret_form.addRow("IPSet mode", self.ipset_mode_combo)
+        zapret_form.addRow(self._t("Gaming mode", "Gaming mode"), self.game_mode_combo)
+
+        tg_form = self._settings_section(canvas_layout, "TG WS Proxy")
+        tg_form.addRow(self._t("Хост", "Host"), self.tg_host_input)
+        tg_form.addRow(self._t("Порт", "Port"), self.tg_port_input)
+        tg_form.addRow(self._t("Секрет", "Secret"), self.tg_secret_input)
+        tg_form.addRow(self._t("Media mode", "Media mode"), self.tg_media_mode_combo)
+        tg_form.addRow("DC -> IP", self.tg_dc_ip_input)
+        tg_form.addRow("", self.tg_cfproxy_checkbox)
+        tg_form.addRow("", self.tg_cfproxy_priority_checkbox)
+        tg_form.addRow(self._t("CF domain", "CF domain"), self.tg_cfproxy_domain_input)
+        tg_form.addRow(self._t("Fake TLS domain", "Fake TLS domain"), self.tg_fake_tls_input)
+        tg_form.addRow(self._t("Буфер, КБ", "Buffer, KB"), self.tg_buf_input)
+        tg_form.addRow(self._t("Pool size", "Pool size"), self.tg_pool_input)
+
+        self.tg_media_mode_combo.currentIndexChanged.connect(self._apply_tg_media_preset)
 
         credits = QLabel(
             self._t(
@@ -1583,7 +1627,8 @@ class SettingsDialog(AppDialog):
             )
         )
         credits.setProperty("class", "muted")
-        layout.addWidget(credits)
+        canvas_layout.addWidget(credits)
+        canvas_layout.addStretch(1)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -1597,6 +1642,24 @@ class SettingsDialog(AppDialog):
         layout.addLayout(buttons)
         self._load()
 
+    def _settings_section(self, parent_layout: QVBoxLayout, title: str) -> QFormLayout:
+        frame = QFrame()
+        frame.setProperty("class", "settingsSection")
+        section_layout = QVBoxLayout(frame)
+        section_layout.setContentsMargins(14, 12, 14, 14)
+        section_layout.setSpacing(10)
+        label = QLabel(title)
+        label.setProperty("class", "title")
+        section_layout.addWidget(label)
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(9)
+        section_layout.addLayout(form)
+        parent_layout.addWidget(frame)
+        return form
+
     def _t(self, ru: str, en: str) -> str:
         return ru if self.context.settings.get().language == "ru" else en
 
@@ -1608,6 +1671,14 @@ class SettingsDialog(AppDialog):
         self.tg_host_input.setText(settings.tg_proxy_host)
         self.tg_port_input.setText(str(settings.tg_proxy_port))
         self.tg_secret_input.setText(settings.tg_proxy_secret)
+        self.tg_dc_ip_input.setPlainText(settings.tg_proxy_dc_ip)
+        self.tg_cfproxy_checkbox.setChecked(settings.tg_proxy_cfproxy_enabled)
+        self.tg_cfproxy_priority_checkbox.setChecked(settings.tg_proxy_cfproxy_priority)
+        self.tg_cfproxy_domain_input.setText(settings.tg_proxy_cfproxy_domain)
+        self.tg_fake_tls_input.setText(settings.tg_proxy_fake_tls_domain)
+        self.tg_buf_input.setText(str(settings.tg_proxy_buf_kb))
+        self.tg_pool_input.setText(str(settings.tg_proxy_pool_size))
+        self._sync_tg_media_mode_from_dc_ip(settings.tg_proxy_dc_ip)
         ipset_idx = self.ipset_mode_combo.findData(settings.zapret_ipset_mode)
         self.ipset_mode_combo.setCurrentIndex(ipset_idx if ipset_idx >= 0 else 0)
         game_idx = self.game_mode_combo.findData(settings.zapret_game_filter_mode)
@@ -1622,6 +1693,14 @@ class SettingsDialog(AppDialog):
             tg_port = int(self.tg_port_input.text().strip() or "1443")
         except ValueError:
             tg_port = 1443
+        try:
+            tg_buf_kb = int(self.tg_buf_input.text().strip() or "256")
+        except ValueError:
+            tg_buf_kb = 256
+        try:
+            tg_pool_size = int(self.tg_pool_input.text().strip() or "4")
+        except ValueError:
+            tg_pool_size = 4
         return {
             "theme": self.theme_combo.currentData() or "night",
             "active_profile_id": self.context.settings.get().active_profile_id,
@@ -1630,6 +1709,13 @@ class SettingsDialog(AppDialog):
             "tg_proxy_host": self.tg_host_input.text().strip() or "127.0.0.1",
             "tg_proxy_port": tg_port,
             "tg_proxy_secret": self.tg_secret_input.text().strip(),
+            "tg_proxy_dc_ip": self.tg_dc_ip_input.toPlainText().strip(),
+            "tg_proxy_cfproxy_enabled": self.tg_cfproxy_checkbox.isChecked(),
+            "tg_proxy_cfproxy_priority": self.tg_cfproxy_priority_checkbox.isChecked(),
+            "tg_proxy_cfproxy_domain": self.tg_cfproxy_domain_input.text().strip(),
+            "tg_proxy_fake_tls_domain": self.tg_fake_tls_input.text().strip(),
+            "tg_proxy_buf_kb": max(4, tg_buf_kb),
+            "tg_proxy_pool_size": max(0, tg_pool_size),
             "zapret_ipset_mode": self.ipset_mode_combo.currentData() or "loaded",
             "zapret_game_filter_mode": self.game_mode_combo.currentData() or "disabled",
             "autostart_windows": self.autostart_checkbox.isChecked(),
@@ -1637,6 +1723,29 @@ class SettingsDialog(AppDialog):
             "auto_run_components": self.auto_components_checkbox.isChecked(),
             "check_updates_on_start": self.check_updates_checkbox.isChecked(),
         }
+
+    def _sync_tg_media_mode_from_dc_ip(self, value: str) -> None:
+        normalized = "\n".join(line.strip() for line in str(value or "").splitlines() if line.strip())
+        mapping = {
+            "2:149.154.167.220\n4:149.154.167.220": "default",
+            "4:149.154.167.220": "media_fix",
+            "": "empty",
+        }
+        mode = mapping.get(normalized, "default")
+        index = self.tg_media_mode_combo.findData(mode)
+        if index >= 0:
+            self.tg_media_mode_combo.blockSignals(True)
+            self.tg_media_mode_combo.setCurrentIndex(index)
+            self.tg_media_mode_combo.blockSignals(False)
+
+    def _apply_tg_media_preset(self) -> None:
+        mode = str(self.tg_media_mode_combo.currentData() or "default")
+        if mode == "media_fix":
+            self.tg_dc_ip_input.setPlainText("4:149.154.167.220")
+        elif mode == "empty":
+            self.tg_dc_ip_input.setPlainText("")
+        else:
+            self.tg_dc_ip_input.setPlainText("2:149.154.167.220\n4:149.154.167.220")
 
 
 class MainWindow(QMainWindow):
@@ -1784,6 +1893,7 @@ class MainWindow(QMainWindow):
         self._files_intro_label: QLabel | None = None
         self._file_mode_cards: list[dict[str, object]] = []
         self._current_file_collection = "domains"
+        self._current_file_list_filter = "all"
         self._favorite_general_buttons: dict[str, QToolButton] = {}
         self._general_options_cache: list[dict[str, str]] | None = None
         self._general_options_refresh_in_progress = False
@@ -1926,7 +2036,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda: self._submit_backend_task("load_startup_snapshot", action_id="__startup_snapshot__"))
 
     def _themed_icon_color(self, filename: str) -> QColor | None:
-        if filename not in {"power.svg", "share.svg", "trash.svg", "search.svg", "refresh.svg"}:
+        if filename not in {"power.svg", "share.svg", "trash.svg", "search.svg", "refresh.svg", "external.svg"}:
             return None
         theme = self.context.settings.get().theme
         if is_light_theme(theme):
@@ -2981,6 +3091,12 @@ class MainWindow(QMainWindow):
                 "files_exclude.svg",
             ),
             (
+                "General",
+                self._t("Редактировать доступные general-конфигурации Zapret.", "Edit available Zapret general configurations."),
+                "generals",
+                "components.svg",
+            ),
+            (
                 self._t("Редактирование файлов", "Advanced editor"),
                 self._t("Открыть полноценный список файлов и текстовый редактор.", "Open the full file list and the text editor."),
                 "advanced",
@@ -4011,6 +4127,12 @@ class MainWindow(QMainWindow):
                 if self.pages.currentIndex() == 3:
                     self.refresh_files(files_payload)
             return
+        if action == "load_components_payload":
+            if isinstance(payload, dict):
+                self._page_payload_cache["components"] = payload
+                if self.pages.currentIndex() == 1:
+                    self.refresh_components(payload)
+            return
         if action == "write_file_text":
             saved_path = str(payload.get("path", "") or "")
             if saved_path:
@@ -4828,6 +4950,7 @@ class MainWindow(QMainWindow):
             return
         if mode == "home":
             self._cancel_file_tag_render()
+            self._current_file_list_filter = "all"
             self._file_mode_stack.setCurrentIndex(0)
             self._set_files_mode_loading(False)
             self._toggle_file_search(False)
@@ -4835,19 +4958,25 @@ class MainWindow(QMainWindow):
                 self._files_home_scroll.verticalScrollBar().setValue(0)
             QTimer.singleShot(0, self._sync_files_home_layout)
             return
-        if mode in {"advanced", "hosts"}:
+        if mode in {"advanced", "hosts", "generals"}:
             self._cancel_file_tag_render()
+            self._current_file_list_filter = "generals" if mode == "generals" else "all"
             self._preferred_file_path = str(self.context.files.local_hosts_path()) if mode == "hosts" else ""
             self._file_mode_stack.setCurrentIndex(2)
             self._use_file_search_variant("document")
             self._file_search_mode = "document"
-            self.file_path_label.setText(self._t("Загрузка файлов...", "Loading files..."))
+            self.file_path_label.setText(
+                self._t("Загрузка General...", "Loading General...")
+                if mode == "generals"
+                else self._t("Загрузка файлов...", "Loading files...")
+            )
             self.file_editor.clear()
             self.files_list.clear()
             self._set_files_mode_loading(True)
             QTimer.singleShot(0, lambda: self._request_page_refresh("files"))
             return
         self._cancel_file_tag_render()
+        self._current_file_list_filter = "all"
         self._use_file_search_variant("tags")
         self._file_search_mode = "tags"
         self._current_file_collection = mode
@@ -4953,10 +5082,12 @@ class MainWindow(QMainWindow):
         return payload
 
     def _build_files_payload_sync(self, mode_index: int, collection_id: str) -> dict[str, object]:
+        file_filter = self._current_file_list_filter
         return {
             "mode_index": mode_index,
             "collection_id": collection_id,
-            "records": self.context.files.list_files() if mode_index == 2 else None,
+            "file_filter": file_filter,
+            "records": self._general_file_records_sync() if (mode_index == 2 and file_filter == "generals") else (self.context.files.list_files() if mode_index == 2 else None),
             "collection_values": self.context.files.read_collection(collection_id) if mode_index == 1 else None,
         }
 
@@ -6334,17 +6465,19 @@ class MainWindow(QMainWindow):
             token = self._files_refresh_token
             mode_index = self._file_mode_stack.currentIndex() if self._file_mode_stack is not None else 0
             collection_id = self._current_file_collection
+            file_filter = self._current_file_list_filter
             cached = self._page_payload_cache.get(section)
             if isinstance(cached, dict):
                 cached_mode = int(cached.get("mode_index", -1) or -1)
                 cached_collection = str(cached.get("collection_id", "") or "")
-                if cached_mode == mode_index and cached_collection == collection_id:
+                cached_filter = str(cached.get("file_filter", "all") or "all")
+                if cached_mode == mode_index and cached_collection == collection_id and cached_filter == file_filter:
                     self.refresh_files(cached)
             if self.context.backend is not None:
                 try:
                     self._submit_backend_task(
                         "load_files_payload",
-                        {"_token": token, "mode_index": mode_index, "collection_id": collection_id},
+                        {"_token": token, "mode_index": mode_index, "collection_id": collection_id, "file_filter": file_filter},
                         action_id="__files_payload__",
                     )
                     return
@@ -6352,11 +6485,17 @@ class MainWindow(QMainWindow):
                     pass
             thread = threading.Thread(
                 target=self._collect_files_payload_worker,
-                args=(token, mode_index, collection_id),
+                args=(token, mode_index, collection_id, file_filter),
                 daemon=True,
             )
             thread.start()
             return
+        if section == "components" and self.context.backend is not None:
+            try:
+                self._submit_backend_task("load_components_payload", action_id="__components_payload__")
+                return
+            except Exception:
+                pass
         cached = self._page_payload_cache.get(section)
         if cached is not None:
             if section == "components":
@@ -6373,18 +6512,39 @@ class MainWindow(QMainWindow):
         thread = threading.Thread(target=self._collect_page_payload_worker, args=(section,), daemon=True)
         thread.start()
 
-    def _collect_files_payload_worker(self, token: int, mode_index: int, collection_id: str) -> None:
+    def _collect_files_payload_worker(self, token: int, mode_index: int, collection_id: str, file_filter: str = "all") -> None:
         try:
             payload = {
                 "_token": token,
                 "mode_index": mode_index,
                 "collection_id": collection_id,
-                "records": self.context.files.list_files() if mode_index == 2 else None,
+                "file_filter": file_filter,
+                "records": self._general_file_records_sync() if (mode_index == 2 and file_filter == "generals") else (self.context.files.list_files() if mode_index == 2 else None),
                 "collection_values": self.context.files.read_collection(collection_id) if mode_index == 1 else None,
             }
             self._ui_signals.page_payload_ready.emit("files", payload)
         except Exception:
-            self._ui_signals.page_payload_ready.emit("files", {"_token": token, "mode_index": mode_index, "collection_id": collection_id, "records": None, "collection_values": None})
+            self._ui_signals.page_payload_ready.emit("files", {"_token": token, "mode_index": mode_index, "collection_id": collection_id, "file_filter": file_filter, "records": None, "collection_values": None})
+
+    def _general_file_records_sync(self) -> list[FileRecord]:
+        records: list[FileRecord] = []
+        seen: set[str] = set()
+        for option in self.context.processes.list_zapret_generals():
+            path = Path(str(option.get("path", "") or ""))
+            if not path.exists() or not path.is_file():
+                continue
+            resolved = str(path.resolve()).lower()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                relative = str(path.relative_to(self.context.paths.install_root))
+            except ValueError:
+                relative = str(path)
+            bundle = str(option.get("bundle", "") or "").strip()
+            label = f"{bundle}/{path.name}" if bundle else path.name
+            records.append(FileRecord(path=str(path), relative_path=label if label else relative, size=path.stat().st_size))
+        return sorted(records, key=lambda item: item.relative_path.lower())
 
     def _collect_page_payload_worker(self, section: str) -> None:
         try:
@@ -6404,10 +6564,11 @@ class MainWindow(QMainWindow):
                 mode_index = self._file_mode_stack.currentIndex() if self._file_mode_stack is not None else 0
                 collection_id = self._current_file_collection
                 payload = {
-                    "records": self.context.files.list_files() if mode_index == 2 else None,
+                    "records": self._general_file_records_sync() if (mode_index == 2 and self._current_file_list_filter == "generals") else (self.context.files.list_files() if mode_index == 2 else None),
                     "collection_values": self.context.files.read_collection(collection_id) if mode_index == 1 else None,
                     "collection_id": collection_id,
                     "mode_index": mode_index,
+                    "file_filter": self._current_file_list_filter,
                 }
             elif section == "logs":
                 source_id = self._current_log_source
@@ -7242,9 +7403,17 @@ class MainWindow(QMainWindow):
     def refresh_components(self, payload: object | None = None) -> None:
         components: list[ComponentDefinition] = []
         states: dict[str, ComponentState] = {}
+        general_options_from_payload: list[dict[str, str]] | None = None
         explicit_payload = False
         if isinstance(payload, dict):
             explicit_payload = "components" in payload or "states" in payload
+            raw_general_options = payload.get("general_options")
+            if isinstance(raw_general_options, list):
+                general_options_from_payload = [
+                    item for item in raw_general_options if isinstance(item, dict) and item.get("id")
+                ]
+                if general_options_from_payload:
+                    self._general_options_cache = general_options_from_payload
             raw_components = payload.get("components", [])
             raw_states = payload.get("states", {})
             if isinstance(raw_components, list):
@@ -7369,6 +7538,15 @@ class MainWindow(QMainWindow):
             icon_row.addWidget(icon, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             icon_row.addStretch(1)
             if component.id in {"zapret", "tg-ws-proxy"}:
+                source_icon_btn = QToolButton()
+                source_icon_btn.setProperty("class", "action")
+                source_icon_btn.setIcon(self._icon("external.svg"))
+                source_icon_btn.setIconSize(QSize(16, 16))
+                source_icon_btn.setFixedSize(30, 30)
+                source_icon_btn.setToolTip(self._t("Источник", "Source"))
+                source_icon_btn.clicked.connect(lambda _=False, url=component.source: self._open_update_link(url))
+                self._attach_button_animations(source_icon_btn)
+                icon_row.addWidget(source_icon_btn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
                 update_icon_btn = QToolButton()
                 update_icon_btn.setProperty("class", "action")
                 update_icon_btn.setIcon(self._icon("refresh.svg"))
@@ -7411,6 +7589,8 @@ class MainWindow(QMainWindow):
             participation.setWordWrap(True)
             card_layout.addWidget(participation)
             if component.id == "zapret":
+                if not self._sorted_general_options() and general_options_from_payload:
+                    self._general_options_cache = general_options_from_payload
                 config_label = QLabel(self._t("Конфигурация Zapret", "Zapret Configuration"))
                 config_label.setProperty("class", "muted")
                 card_layout.addWidget(config_label)
@@ -7422,6 +7602,13 @@ class MainWindow(QMainWindow):
                 selected = self.context.settings.get().selected_zapret_general
                 for option in options:
                     config_combo.addItem(self._format_general_option_label(option), option["id"])
+                if config_combo.count() == 0:
+                    config_combo.addItem(self._t("Конфигурации загружаются", "Configurations are loading"), "")
+                    config_combo.setEnabled(False)
+                    try:
+                        self._submit_backend_task("load_components_payload")
+                    except Exception:
+                        pass
                 if config_combo.count() > 0:
                     picked_index = 0
                     for i in range(config_combo.count()):
@@ -8095,6 +8282,9 @@ class MainWindow(QMainWindow):
             if payload_mode not in {-1, mode_index}:
                 return
             payload_collection = str(payload.get("collection_id", "") or "")
+            payload_filter = str(payload.get("file_filter", "all") or "all")
+            if mode_index == 2 and payload_filter != self._current_file_list_filter:
+                return
             if mode_index == 1 and payload_collection != self._current_file_collection:
                 return
             if mode_index == 1 and payload_collection == self._current_file_collection and payload.get("collection_values") is not None:
@@ -8124,12 +8314,24 @@ class MainWindow(QMainWindow):
         preferred = self._preferred_file_path
         self.files_list.clear()
         for record in records:
-            row_item = QListWidgetItem(f"{record.relative_path}\n{self._t('Размер', 'Size')}: {record.size} {self._t('байт', 'bytes')}")
-            row_item.setData(Qt.ItemDataRole.UserRole, record.path)
+            if isinstance(record, dict):
+                relative_path = str(record.get("relative_path", "") or record.get("path", ""))
+                size = int(record.get("size", 0) or 0)
+                path = str(record.get("path", "") or "")
+            else:
+                relative_path = str(getattr(record, "relative_path", ""))
+                size = int(getattr(record, "size", 0) or 0)
+                path = str(getattr(record, "path", "") or "")
+            row_item = QListWidgetItem(f"{relative_path}\n{self._t('Размер', 'Size')}: {size} {self._t('байт', 'bytes')}")
+            row_item.setData(Qt.ItemDataRole.UserRole, path)
             row_item.setSizeHint(QSize(200, 54))
             self.files_list.addItem(row_item)
         if not records:
-            self.file_path_label.setText(self._t("Файлы не найдены", "No files found"))
+            self.file_path_label.setText(
+                self._t("General-файлы не найдены", "No General files found")
+                if self._current_file_list_filter == "generals"
+                else self._t("Файлы не найдены", "No files found")
+            )
             self.file_editor.clear()
             self._set_file_editor_loading(False)
             return

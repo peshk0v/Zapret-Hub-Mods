@@ -1,8 +1,6 @@
 param(
     [string]$Python = ".\.venv\Scripts\python.exe",
-    [string]$OutputDir = "dist_nuitka",
-    [ValidateSet("zig", "msvc")]
-    [string]$Compiler = "zig"
+    [string]$OutputDir = "dist_nuitka"
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,39 +47,30 @@ foreach ($pattern in $excludeFilePatterns) {
         Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
-$nuitkaArgs = @(
-  "-m", "nuitka",
-  "--standalone",
-  "--assume-yes-for-downloads",
-  "--no-deployment-flag=self-execution",
-  "--enable-plugin=pyside6",
-  "--windows-console-mode=disable",
-  "--windows-icon-from-ico=ui_assets\icons\app_shell.ico",
-  '--company-name=goshkow',
-  '--product-name=Zapret Hub',
-  '--file-version=1.4.2.0',
-  '--product-version=1.4.2.0',
-  '--file-description=Zapret Hub',
-  '--copyright=goshkow',
-  "--output-dir=$OutputDir",
-  "--output-filename=zapret_hub.exe",
-  "--include-data-dir=sample_data=sample_data",
-  "--include-data-dir=ui_assets=ui_assets",
-  "--include-package=cryptography",
-  "--include-package=certifi",
-  "--include-package-data=certifi",
-  "--nofollow-import-to=tkinter",
-  "--remove-output",
-  "src\zapret_hub\main.py"
-)
-
-if ($Compiler -eq "zig") {
-    $nuitkaArgs = @("-m", "nuitka", "--zig") + $nuitkaArgs[2..($nuitkaArgs.Length - 1)]
-} else {
-    $nuitkaArgs = @("-m", "nuitka", "--msvc=latest") + $nuitkaArgs[2..($nuitkaArgs.Length - 1)]
-}
-
-& $Python @nuitkaArgs
+& $Python -m nuitka `
+  --standalone `
+  --assume-yes-for-downloads `
+  --no-deployment-flag=self-execution `
+  --zig `
+  --enable-plugin=pyside6 `
+  --windows-console-mode=disable `
+  --windows-icon-from-ico=ui_assets\icons\app_shell.ico `
+  --company-name="goshkow" `
+  --product-name="Zapret Hub" `
+  --file-version="1.4.3.0" `
+  --product-version="1.4.3.0" `
+  --file-description="Zapret Hub" `
+  --copyright="goshkow" `
+  --output-dir=$OutputDir `
+  --output-filename="zapret_hub.exe" `
+  --include-data-dir=sample_data=sample_data `
+  --include-data-dir=ui_assets=ui_assets `
+  --include-package=cryptography `
+  --include-package=certifi `
+  --include-package-data=certifi `
+  --nofollow-import-to=tkinter `
+  --remove-output `
+  src\zapret_hub\main.py
 if ($LASTEXITCODE -ne 0) { throw "Nuitka app build failed with exit code $LASTEXITCODE" }
 
 $distDir = Get-ChildItem -Path $OutputDir -Directory -Filter "*.dist" | Select-Object -First 1

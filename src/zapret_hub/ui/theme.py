@@ -74,6 +74,15 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
     #DialogBody {
         background: transparent;
     }
+    #SettingsScroll, #SettingsCanvas, #SettingsScroll QWidget#qt_scrollarea_viewport {
+        background: transparent;
+        border: none;
+    }
+    QFrame[class="settingsSection"] {
+        background: #141f32;
+        border: 1px solid #1b2940;
+        border-radius: 14px;
+    }
     #LoadingOverlay {
         background: rgba(9, 13, 22, 0.42);
     }
@@ -536,6 +545,15 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
     }
     #DialogBody {
         background: transparent;
+    }
+    #SettingsScroll, #SettingsCanvas, #SettingsScroll QWidget#qt_scrollarea_viewport {
+        background: transparent;
+        border: none;
+    }
+    QFrame[class="settingsSection"] {
+        background: #ffffff;
+        border: 1px solid #eef3fa;
+        border-radius: 14px;
     }
     #LoadingOverlay {
         background: rgba(228, 236, 248, 0.58);

@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Git tag or release version (for example v1.4.2)"
+        description: "Git tag or release version (for example v1.4.3)"
         required: true
-        default: "v1.4.2"
+        default: "v1.4.3"
       release_name:
         description: "Release title"
         required: true
-        default: "Zapret Hub 1.4.2"
+        default: "Zapret Hub 1.4.3"
       changelog:
         description: "Release changelog"
         required: true
@@ -21,14 +21,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-
-      - name: Clean workspace
-        shell: pwsh
-        run: |
-          Remove-Item .\dist_nuitka -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\.nuitka_staging -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\installer_payload -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\release_1.4.2 -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -45,7 +37,7 @@ jobs:
 
       - name: Build Nuitka x64
         shell: pwsh
-        run: .\scripts\build_nuitka.ps1 -Python python -OutputDir dist_nuitka -Compiler zig
+        run: .\scripts\build_nuitka.ps1 -Python python -OutputDir dist_nuitka
 
       - name: Upload x64 artifact
         uses: actions/upload-artifact@v6
@@ -59,14 +51,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-
-      - name: Clean workspace
-        shell: pwsh
-        run: |
-          Remove-Item .\dist_nuitka -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\.nuitka_staging -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\installer_payload -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\release_1.4.2 -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -86,7 +70,7 @@ jobs:
 
       - name: Build Nuitka arm64
         shell: pwsh
-        run: .\scripts\build_nuitka.ps1 -Python python -OutputDir dist_nuitka -Compiler msvc
+        run: .\scripts\build_nuitka.ps1 -Python python -OutputDir dist_nuitka
 
       - name: Upload arm64 artifact
         uses: actions/upload-artifact@v6
@@ -105,16 +89,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-
-      - name: Clean workspace
-        shell: pwsh
-        run: |
-          Remove-Item .\dist_nuitka -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\dist_installer -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\.nuitka_staging -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\.artifacts -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\installer_payload -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\release_1.4.2 -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -148,8 +122,8 @@ jobs:
           --x64-source .\.artifacts\win_x64
           --arm64-source .\.artifacts\win_arm64
           --payload-dir .\installer_payload
-          --release-dir .\release_1.4.2
-          --version 1.4.2
+          --release-dir .\release_1.4.3
+          --version 1.4.3
 
       - name: Build universal installer
         shell: pwsh
@@ -157,11 +131,7 @@ jobs:
 
       - name: Place installer into release folder
         shell: pwsh
-        run: Copy-Item .\dist_installer\install_zaprethub_1.4.2_universal.exe .\release_1.4.2\ -Force
-
-      - name: Prepare release notes body
-        shell: pwsh
-        run: Copy-Item .\.github\release-notes\1.4.2.md .\.release_body.md -Force
+        run: Copy-Item .\dist_installer\install_zaprethub_1.4.3_universal.exe .\release_1.4.3\ -Force
 
       - name: SignPath placeholder
         shell: pwsh
@@ -172,7 +142,7 @@ jobs:
         with:
           tag_name: ${{ inputs.tag }}
           name: ${{ inputs.release_name }}
-          body_path: .\.release_body.md
+          body: ${{ inputs.changelog }}
           files: |
-            release_1.4.2/install_zaprethub_1.4.2_universal.exe
-            release_1.4.2/*portable*.zip
+            release_1.4.3/install_zaprethub_1.4.3_universal.exe
+            release_1.4.3/*portable*.zip
