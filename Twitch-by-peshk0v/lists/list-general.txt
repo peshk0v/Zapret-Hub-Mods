@@ -1,0 +1,13 @@
+twitchcdn.net
+twitch.tv
+ext-twitch.tv
+assets.twitch.tv
+scorecardresearch.com
+live-video.net
+gstatic.com
+jtvnw.net
+amazon-adsystem.com
+cloudfront.net
+ttvnw.net
+gql.twitch.tv
+sb.scorecardresearch.com
