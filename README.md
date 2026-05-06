@@ -5,8 +5,8 @@
 Статус:
 | Мод | Статус |
 |------|----------|
-| ROBLOX | Релиз |
-| SoundCloud | Бета |
-| X | Релиз |
+| [ROBLOX](https://github.com/peshk0v/Zapret-Hub-Mods/releases/tag/ROBLOX) | Релиз |
+| [SoundCloud](https://github.com/peshk0v/Zapret-Hub-Mods/releases/tag/SoundCloud) | Бета |
+| [X](https://github.com/peshk0v/Zapret-Hub-Mods/releases/tag/X.com) | Релиз |
 | Minecraft Mods | В планах |
-| Twitch.tv | Релиз |
+| [Twitch.tv](https://github.com/peshk0v/Zapret-Hub-Mods/releases/tag/Twitch) | Релиз |
