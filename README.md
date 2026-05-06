@@ -9,4 +9,4 @@
 | SoundCloud | Бета |
 | X | Релиз |
 | Minecraft Mods | В планах |
-| Twitch.tv | Бета |
+| Twitch.tv | Релиз |
