@@ -1,4 +1,4 @@
-# Zapret Hub Modifications
+# [Zapret Hub](https://github.com/goshkow/Zapret-Hub) Modifications
 
 <div align="center">
 
